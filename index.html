@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>栖云录</title>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="ui"></div>
+    <div id="boot">
+      <div class="boot-inner">
+        <div class="boot-title">栖云录</div>
+        <div class="boot-sub">一剑一江湖 · 功夫是练出来的</div>
+        <div class="boot-bar"><i id="boot-fill"></i></div>
+        <div class="boot-tip" id="boot-tip">正在入画……</div>
+        <div class="boot-actions" id="boot-actions" hidden>
+          <button id="btn-continue" hidden>继续旅程</button>
+          <button id="btn-new">踏入江湖</button>
+        </div>
+        <div class="boot-help" id="boot-help" hidden>
+          左键：移动 / 攻击 / 对话 / 拾取　·　空格或右键：绝招　·　Z：打坐　·　Tab：选敌<br />
+          C 人物　K 武功　B 行囊　L 任务　M 地图　·　1–4 快捷物品　·　滚轮缩放
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
