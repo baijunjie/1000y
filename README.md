@@ -37,6 +37,8 @@ pnpm build      # 产物在 dist/，可用 pnpm preview 查看
 
 人物与动物的建模代码在 `tools/bake/src/humanoid.ts`、`tools/bake/src/creature_*.ts`，造型参数在 `tools/bake/src/jobs.ts`。
 
+接手开发前先读 [开发笔记](docs/dev-notes.md)：设计取舍的原因、踩过的坑、验证方法和还欠着的事都在里面。
+
 ## 目录
 
 | 路径 | 内容 |
