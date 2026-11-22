@@ -1,413 +1,342 @@
-import { AtlasMeta, COS, FrameMeta, SIN } from '../shared/consts';
-import { GL, makeFBO, makeTex, Program } from './gl';
-import {
-  BLOOM_DOWN_FS, BLOOM_UP_FS, BLUR_FS, COMPOSITE_FS, FULLSCREEN_VS, FX_FS, FX_VS, GROUND_FS, LIGHT_FS,
-  MAX_LIGHTS, SHADOW_FS, SPRITE_EMIS_FS, SPRITE_FS, SPRITE_VS,
-} from './shaders';
+import * as THREE from 'three';
+import { EMISSIVE_MATS } from '../models/geo';
+import { FOG_LIGHTS, Post } from './post';
 
-export interface Atlas {
-  meta: AtlasMeta;
-  color: WebGLTexture;
-  normal: WebGLTexture;
-  shadow: WebGLTexture | null;
-  id: number;
-}
+type V3 = [number, number, number];
 
+/** 一帧的环境参数（由时辰插值得到）。颜色都是线性空间、已含强度。 */
 export interface Env {
-  sunDir: [number, number, number];
-  sunCol: [number, number, number];
-  ambSky: [number, number, number];
-  ambGnd: [number, number, number];
-  skyRefl: [number, number, number];
-  fog: [number, number, number, number];
-  shadowK: number;
+  /** 指向主光（日 / 月）的单位方向 */
+  sunDir: V3;
+  sunCol: V3;
+  /** 天光与地面反光（半球环境光） */
+  ambSky: V3;
+  ambGnd: V3;
+  /** 环境贴图（高光反射）强度 */
+  envK: number;
+  fogCol: V3;
+  fogDensity: number;
+  fogFalloff: number;
+  /** 日光光束强度 */
+  shaftK: number;
   exposure: number;
   bloom: number;
   sat: number;
-  tint: [number, number, number];
+  contrast: number;
+  tint: V3;
   vignette: number;
-  /** 0 = 白天，1 = 深夜（自发光贴图强度） */
+  /** 0 = 白天，1 = 深夜（灯火与自发光的强度） */
   night: number;
 }
 
-export interface GroundTex {
-  tileC: WebGLTexture;
-  tileN: WebGLTexture;
-  splat: WebGLTexture;
-  aux: WebGLTexture;
-  mapW: number;
-  mapH: number;
-}
+/** 俯角与视场：窄视场 + 较远机位，接近等距视角但保留透视纵深 */
+const PITCH = (50 * Math.PI) / 180;
+const FOV = 30;
+const CAM_DIST = 25;
+/** three 的漫反射带 1/π，这里把「期望的出射亮度」换算成光源强度 */
+const PI = Math.PI;
+const POINT_K = 2.4;
 
-const INST = 16; // 每个精灵实例的 float 数
+// 点光源的距离衰减改成「带软核」的平方反比：贴近灯的墙面不至于过曝，稍远处仍按 1/d² 落下去
+THREE.ShaderChunk.lights_pars_begin = THREE.ShaderChunk.lights_pars_begin.replace(
+  'float distanceFalloff = 1.0 / max( pow( lightDistance, decayExponent ), 0.01 );',
+  'float distanceFalloff = 1.0 / ( pow( lightDistance, decayExponent ) + 0.8 );',
+);
 
-class InstBuf {
-  data: Float32Array;
-  n = 0;
-  constructor(cap: number) { this.data = new Float32Array(cap * INST); }
-  ensure() {
-    if ((this.n + 1) * INST > this.data.length) {
-      const d = new Float32Array(this.data.length * 2);
-      d.set(this.data);
-      this.data = d;
-    }
-  }
-}
+let N_SHADOW = 3;
+let N_PLAIN = 9;
 
-interface SpriteCmd { key: number; atlas: Atlas; off: number; }
+interface LightReq { key: string; x: number; y: number; z: number; r: number; c: V3; k: number; shadow: boolean; score: number; }
+interface Slot { light: THREE.PointLight; key: string | null; fade: number; shadow: boolean; req: LightReq | null; }
 
 export class Renderer {
-  gl: GL;
-  cam = { x: 0, y: 0, ppm: 80 };
-  W = 1; H = 1;
+  gl: THREE.WebGLRenderer;
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(FOV, 1, 1, 400);
+  post: Post;
+  W = 2; H = 2;
   time = 0;
-  hdrOK = true;
-  /** 调试视图：1 阴影遮罩 2 反照率 3 法线/高度 */
+  /** 镜头注视点（世界坐标）与缩放 */
+  focus = new THREE.Vector3();
+  zoom = 1;
+  shake = 0;
+  /** 调试视图：1 遮蔽 2 雾的散射 3 雾的透过率 */
   debug = 0;
+  /** 渲染分辨率倍率（相对 CSS 像素 × devicePixelRatio） */
+  scale = 1;
+  noise: THREE.DataTexture;
+  fxTex: THREE.CanvasTexture;
+  /** 所有打过补丁的材质共用的 uniform */
+  uniforms = {
+    uTime: { value: 0 },
+    uHoleA: { value: new THREE.Vector3() },
+    uHoleB: { value: new THREE.Vector3(0, -100, 0) },
+    uHoleR: { value: 1.25 },
+  };
 
-  private pGround: Program; private pSprite: Program; private pEmis: Program; private pShadow: Program;
-  private pBlur: Program; private pLight: Program; private pFx: Program; private pDown: Program; private pUp: Program; private pComp: Program;
-  private vaoInst: WebGLVertexArrayObject; private instVbo: WebGLBuffer;
-  private vaoFx: WebGLVertexArrayObject; private fxVbo: WebGLBuffer; private fxIbo: WebGLBuffer;
-  private vaoEmpty: WebGLVertexArrayObject;
+  private sun = new THREE.DirectionalLight(0xffffff, 1);
+  private hemi = new THREE.HemisphereLight(0xffffff, 0x000000, 1);
+  private slots: Slot[] = [];
+  private reqs: LightReq[] = [];
+  private fogLightPos = new Float32Array(FOG_LIGHTS * 4);
+  private fogLightCol = new Float32Array(FOG_LIGHTS * 3);
+  private fogLightN = 0;
 
-  private tAlbedo!: WebGLTexture; private tNormal!: WebGLTexture; private tMat!: WebGLTexture; private tDepth!: WebGLTexture; private tHdr!: WebGLTexture;
-  private fGbuf!: WebGLFramebuffer; private fHdr!: WebGLFramebuffer;
-  private tSh: WebGLTexture[] = []; private fSh: WebGLFramebuffer[] = []; private shW = 1; private shH = 1;
-  private bloomT: WebGLTexture[] = []; private bloomF: WebGLFramebuffer[] = []; private bloomS: [number, number][] = [];
-
-  noise: WebGLTexture;
-  fxTex: WebGLTexture;
-  ground: GroundTex | null = null;
-
-  // 每帧队列
-  private sprites = new InstBuf(2048);
-  private spriteCmds: SpriteCmd[] = [];
-  private emis = new InstBuf(256);
-  private emisCmds: SpriteCmd[] = [];
-  private shadows = new InstBuf(1024);
-  private shadowCmds: SpriteCmd[] = [];
-  private fxData = new Float32Array(4096 * 4 * 9);
+  private fxGeo = new THREE.BufferGeometry();
+  private fxPos: THREE.BufferAttribute; private fxUv: THREE.BufferAttribute; private fxCol: THREE.BufferAttribute;
   private fxN = 0;
-  private lightPos = new Float32Array(MAX_LIGHTS * 4);
-  private lightCol = new Float32Array(MAX_LIGHTS * 4);
-  private lightList: { x: number; y: number; z: number; r: number; c: [number, number, number]; w: number }[] = [];
-  private atlasSeq = 0;
+  private static FX_MAX = 8192;
+  private lastNight = -1;
+  private frame = 0;
+  private camRight = new THREE.Vector3(); private camUp = new THREE.Vector3();
+  private tmp = new THREE.Vector3(); private tmp2 = new THREE.Vector3();
+  private sunDirV = new THREE.Vector3(0.4, 0.8, 0.4);
 
-  constructor(public canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
-    if (!gl) throw new Error('浏览器不支持 WebGL2');
+  constructor(public canvas: HTMLCanvasElement, opts: { samples?: number; shadowLights?: number; plainLights?: number } = {}) {
+    N_SHADOW = opts.shadowLights ?? N_SHADOW; N_PLAIN = opts.plainLights ?? N_PLAIN;
+    const gl = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
     this.gl = gl;
-    this.hdrOK = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
-    gl.getExtension('OES_texture_float_linear');
+    gl.setPixelRatio(1);
+    gl.toneMapping = THREE.NoToneMapping;
+    gl.shadowMap.enabled = true;
+    gl.shadowMap.type = THREE.PCFShadowMap;
+    gl.info.autoReset = false;
 
-    this.pGround = new Program(gl, FULLSCREEN_VS, GROUND_FS);
-    this.pSprite = new Program(gl, SPRITE_VS, SPRITE_FS);
-    this.pEmis = new Program(gl, SPRITE_VS, SPRITE_EMIS_FS);
-    this.pShadow = new Program(gl, SPRITE_VS, SHADOW_FS);
-    this.pBlur = new Program(gl, FULLSCREEN_VS, BLUR_FS);
-    this.pLight = new Program(gl, FULLSCREEN_VS, LIGHT_FS);
-    this.pFx = new Program(gl, FX_VS, FX_FS);
-    this.pDown = new Program(gl, FULLSCREEN_VS, BLOOM_DOWN_FS);
-    this.pUp = new Program(gl, FULLSCREEN_VS, BLOOM_UP_FS);
-    this.pComp = new Program(gl, FULLSCREEN_VS, COMPOSITE_FS);
+    this.noise = makeNoise();
+    this.fxTex = makeFxTex();
+    this.post = new Post(gl, this.noise, opts.samples ?? 4);
 
-    this.vaoEmpty = gl.createVertexArray()!;
-    this.vaoInst = gl.createVertexArray()!;
-    this.instVbo = gl.createBuffer()!;
-    gl.bindVertexArray(this.vaoInst);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instVbo);
-    for (let i = 0; i < 4; i++) {
-      gl.enableVertexAttribArray(i);
-      gl.vertexAttribPointer(i, 4, gl.FLOAT, false, INST * 4, i * 16);
-      gl.vertexAttribDivisor(i, 1);
+    // ---- 主光与环境光 ----
+    const s = this.sun;
+    s.castShadow = true;
+    s.shadow.mapSize.set(4096, 4096);
+    s.shadow.bias = -0.0003;
+    s.shadow.normalBias = 0.05;
+    s.shadow.radius = 2.4;
+    this.scene.add(s, s.target, this.hemi);
+    this.scene.environment = makeEnvMap(gl);
+    this.scene.background = null;
+
+    // ---- 点光源池：数量固定，避免着色器因灯数变化而重编译 ----
+    for (let i = 0; i < N_SHADOW + N_PLAIN; i++) {
+      const light = new THREE.PointLight(0xffffff, 0, 8, 2);
+      const shadow = i < N_SHADOW;
+      if (shadow) {
+        light.castShadow = true;
+        light.shadow.mapSize.set(768, 768);
+        light.shadow.bias = -0.003;
+        light.shadow.normalBias = 0.04;
+        light.shadow.radius = 2.5;
+        light.shadow.camera.near = 0.08;
+        light.shadow.autoUpdate = false;
+      }
+      light.position.set(0, -50, 0);
+      this.scene.add(light);
+      this.slots.push({ light, key: null, fade: 0, shadow, req: null });
     }
-    this.vaoFx = gl.createVertexArray()!;
-    this.fxVbo = gl.createBuffer()!;
-    this.fxIbo = gl.createBuffer()!;
-    gl.bindVertexArray(this.vaoFx);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVbo);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 36, 12);
-    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 36, 20);
-    const idx = new Uint16Array(8192 * 6);
-    for (let i = 0; i < 8192; i++) idx.set([i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 2, i * 4 + 1, i * 4 + 3], i * 6);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.fxIbo);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
-    gl.bindVertexArray(null);
 
-    this.noise = this.makeNoise();
-    this.fxTex = this.makeFxTex();
+    // ---- 特效批次 ----
+    const N = Renderer.FX_MAX;
+    this.fxPos = new THREE.BufferAttribute(new Float32Array(N * 4 * 3), 3);
+    this.fxUv = new THREE.BufferAttribute(new Float32Array(N * 4 * 2), 2);
+    this.fxCol = new THREE.BufferAttribute(new Float32Array(N * 4 * 4), 4);
+    for (const a of [this.fxPos, this.fxUv, this.fxCol]) a.setUsage(THREE.DynamicDrawUsage);
+    this.fxGeo.setAttribute('position', this.fxPos);
+    this.fxGeo.setAttribute('uv', this.fxUv);
+    this.fxGeo.setAttribute('aCol', this.fxCol);
+    const idx = new Uint32Array(N * 6);
+    for (let i = 0; i < N; i++) idx.set([i * 4, i * 4 + 2, i * 4 + 1, i * 4 + 2, i * 4 + 3, i * 4 + 1], i * 6);
+    this.fxGeo.setIndex(new THREE.BufferAttribute(idx, 1));
+    const fxMat = new THREE.ShaderMaterial({
+      uniforms: { uTex: { value: this.fxTex } },
+      vertexShader: 'attribute vec4 aCol; varying vec2 vUv; varying vec4 vCol; void main(){ vUv = uv; vCol = aCol; gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0); }',
+      fragmentShader: 'uniform sampler2D uTex; varying vec2 vUv; varying vec4 vCol; void main(){ vec4 t = texture2D(uTex, vUv); gl_FragColor = vec4(vCol.rgb * t.rgb * t.a, vCol.a * t.a); }',
+      transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+    });
+    const fx = new THREE.Mesh(this.fxGeo, fxMat);
+    fx.frustumCulled = false;
+    fx.renderOrder = 10;
+    this.scene.add(fx);
+
     this.resize();
+    this.updateCamera();
   }
 
-  // ------------------------------------------------------------ 资源
-  private makeNoise(): WebGLTexture {
-    const gl = this.gl, S = 256;
-    const data = new Uint8Array(S * S * 4);
-    const lattice = (seed: number, period: number) => {
-      const g = new Float32Array(period * period);
-      let s = seed;
-      for (let i = 0; i < g.length; i++) { s = (s * 1664525 + 1013904223) >>> 0; g[i] = s / 4294967296; }
-      return (x: number, y: number) => {
-        const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
-        const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
-        const p = (a: number, b: number) => g[(((b % period) + period) % period) * period + (((a % period) + period) % period)];
-        return p(xi, yi) * (1 - u) * (1 - v) + p(xi + 1, yi) * u * (1 - v) + p(xi, yi + 1) * (1 - u) * v + p(xi + 1, yi + 1) * u * v;
-      };
-    };
-    for (let c = 0; c < 4; c++) {
-      const octs = [4, 8, 16, 32].map((p, i) => lattice(977 + c * 131 + i * 17, p));
-      for (let y = 0; y < S; y++) {
-        for (let x = 0; x < S; x++) {
-          let v = 0, amp = 0.5, tot = 0;
-          octs.forEach((f, i) => { const p = [4, 8, 16, 32][i]; v += f((x / S) * p, (y / S) * p) * amp; tot += amp; amp *= 0.5; });
-          v /= tot;
-          data[(y * S + x) * 4 + c] = Math.min(255, Math.max(0, ((v - 0.5) * 1.9 + 0.5) * 255));
-        }
-      }
-    }
-    const t = makeTex(gl, { w: S, h: S, internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, data, wrap: gl.REPEAT });
-    gl.generateMipmap(gl.TEXTURE_2D);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    return t;
-  }
-
-  /** 特效小图集（4×2 格，每格 128px）：0 柔光圆 1 火星 2 烟团 3 月牙刀光 4 圆环 5 叶片 6 花瓣 7 实心圆 */
-  private makeFxTex(): WebGLTexture {
-    const gl = this.gl, C = 128;
-    const cv = document.createElement('canvas');
-    cv.width = C * 4; cv.height = C * 2;
-    const g = cv.getContext('2d')!;
-    const cell = (i: number, fn: (cx: number, cy: number) => void) => {
-      g.save();
-      g.beginPath(); g.rect((i % 4) * C, Math.floor(i / 4) * C, C, C); g.clip();
-      fn((i % 4) * C + C / 2, Math.floor(i / 4) * C + C / 2);
-      g.restore();
-    };
-    cell(0, (x, y) => {
-      const r = g.createRadialGradient(x, y, 0, x, y, C / 2);
-      r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(0.25, 'rgba(255,255,255,0.55)');
-      r.addColorStop(0.6, 'rgba(255,255,255,0.12)'); r.addColorStop(1, 'rgba(255,255,255,0)');
-      g.fillStyle = r; g.fillRect(x - C / 2, y - C / 2, C, C);
-    });
-    cell(1, (x, y) => {
-      const r = g.createRadialGradient(x, y, 0, x, y, C / 2);
-      r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(0.12, 'rgba(255,255,255,0.9)');
-      r.addColorStop(0.3, 'rgba(255,255,255,0.15)'); r.addColorStop(1, 'rgba(255,255,255,0)');
-      g.fillStyle = r; g.fillRect(x - C / 2, y - C / 2, C, C);
-    });
-    cell(2, (x, y) => {
-      for (let i = 0; i < 9; i++) {
-        const a = i * 2.4, d = i ? 18 + (i % 3) * 7 : 0, rr = 30 - (i % 4) * 4;
-        const cx = x + Math.cos(a) * d, cy = y + Math.sin(a) * d;
-        const r = g.createRadialGradient(cx, cy, 0, cx, cy, rr);
-        r.addColorStop(0, 'rgba(255,255,255,0.5)'); r.addColorStop(1, 'rgba(255,255,255,0)');
-        g.fillStyle = r; g.fillRect(cx - rr, cy - rr, rr * 2, rr * 2);
-      }
-    });
-    cell(3, (x, y) => {
-      // 月牙：外弧亮、向内渐隐，两端收尖
-      for (let i = 0; i < 26; i++) {
-        const t = i / 25;
-        g.beginPath();
-        g.arc(x, y + 34, 86 - t * 30, Math.PI * 1.17, Math.PI * 1.83);
-        g.strokeStyle = `rgba(255,255,255,${(1 - t) * (1 - t) * 0.5})`;
-        g.lineWidth = 2.4;
-        g.stroke();
-      }
-      const m = g.createLinearGradient(x - C / 2, 0, x + C / 2, 0);
-      m.addColorStop(0, 'rgba(0,0,0,1)'); m.addColorStop(0.3, 'rgba(0,0,0,0)'); m.addColorStop(0.7, 'rgba(0,0,0,0)'); m.addColorStop(1, 'rgba(0,0,0,1)');
-      g.globalCompositeOperation = 'destination-out';
-      g.fillStyle = m; g.fillRect(x - C / 2, y - C / 2, C, C);
-      g.globalCompositeOperation = 'source-over';
-    });
-    cell(4, (x, y) => {
-      for (let i = 0; i < 10; i++) {
-        g.beginPath(); g.arc(x, y, 52 - i * 1.2, 0, Math.PI * 2);
-        g.strokeStyle = `rgba(255,255,255,${0.5 - Math.abs(i - 3) * 0.06})`; g.lineWidth = 1.6; g.stroke();
-      }
-    });
-    cell(5, (x, y) => {
-      g.translate(x, y); g.rotate(0.5);
-      g.beginPath(); g.moveTo(-44, 0); g.quadraticCurveTo(0, -30, 44, 0); g.quadraticCurveTo(0, 30, -44, 0);
-      g.fillStyle = 'rgba(255,255,255,1)'; g.fill();
-      g.beginPath(); g.moveTo(-40, 0); g.lineTo(40, 0); g.strokeStyle = 'rgba(160,160,160,1)'; g.lineWidth = 3; g.stroke();
-    });
-    cell(6, (x, y) => {
-      g.translate(x, y);
-      g.beginPath(); g.moveTo(0, -40); g.bezierCurveTo(34, -30, 30, 26, 0, 40); g.bezierCurveTo(-30, 26, -34, -30, 0, -40);
-      const r = g.createLinearGradient(0, -40, 0, 40);
-      r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(1, 'rgba(215,215,215,1)');
-      g.fillStyle = r; g.fill();
-    });
-    cell(7, (x, y) => { g.beginPath(); g.arc(x, y, 56, 0, Math.PI * 2); g.fillStyle = '#fff'; g.fill(); });
-    const t = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    return t;
-  }
-
-  registerAtlas(meta: AtlasMeta, color: WebGLTexture, normal: WebGLTexture, shadow: WebGLTexture | null): Atlas {
-    return { meta, color, normal, shadow, id: ++this.atlasSeq };
-  }
-
-  resize(scale = 1) {
-    const gl = this.gl, c = this.canvas;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2) * scale;
+  resize() {
+    const c = this.canvas;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2) * this.scale;
     const W = Math.max(2, Math.round(c.clientWidth * dpr)), H = Math.max(2, Math.round(c.clientHeight * dpr));
-    if (W === this.W && H === this.H && this.tAlbedo) return;
-    this.W = c.width = W; this.H = c.height = H;
-    const del = (t?: WebGLTexture) => t && gl.deleteTexture(t);
-    [this.tAlbedo, this.tNormal, this.tMat, this.tDepth, this.tHdr, ...this.tSh, ...this.bloomT].forEach(del);
-    [this.fGbuf, this.fHdr, ...this.fSh, ...this.bloomF].forEach((f) => f && gl.deleteFramebuffer(f));
-    this.tAlbedo = makeTex(gl, { w: W, h: H, internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, filter: gl.NEAREST });
-    this.tNormal = makeTex(gl, { w: W, h: H, internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, filter: gl.NEAREST });
-    this.tMat = makeTex(gl, { w: W, h: H, internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, filter: gl.NEAREST });
-    this.tDepth = makeTex(gl, { w: W, h: H, internal: gl.DEPTH_COMPONENT24, format: gl.DEPTH_COMPONENT, type: gl.UNSIGNED_INT, filter: gl.NEAREST });
-    const hdrI = this.hdrOK ? gl.RGBA16F : gl.RGBA8, hdrT = this.hdrOK ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
-    this.tHdr = makeTex(gl, { w: W, h: H, internal: hdrI, format: gl.RGBA, type: hdrT });
-    this.fGbuf = makeFBO(gl, [this.tAlbedo, this.tNormal, this.tMat], this.tDepth);
-    this.fHdr = makeFBO(gl, [this.tHdr], this.tDepth);
-    this.shW = Math.ceil(W / 2); this.shH = Math.ceil(H / 2);
-    this.tSh = [0, 1].map(() => makeTex(gl, { w: this.shW, h: this.shH, internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE }));
-    this.fSh = this.tSh.map((t) => makeFBO(gl, [t]));
-    this.bloomT = []; this.bloomF = []; this.bloomS = [];
-    let bw = W, bh = H;
-    for (let i = 0; i < 6; i++) {
-      bw = Math.max(2, bw >> 1); bh = Math.max(2, bh >> 1);
-      const t = makeTex(gl, { w: bw, h: bh, internal: hdrI, format: gl.RGBA, type: hdrT });
-      this.bloomT.push(t); this.bloomF.push(makeFBO(gl, [t])); this.bloomS.push([bw, bh]);
-    }
+    if (W === this.W && H === this.H) return;
+    this.W = W; this.H = H;
+    this.gl.setSize(W, H, false);
+    this.post.resize(W, H);
+    this.camera.aspect = W / H;
+    this.camera.updateProjectionMatrix();
   }
 
-  // ------------------------------------------------------------ 坐标换算
-  /** 屏幕像素（canvas 内 CSS 像素）→ 地面世界坐标 */
-  screenToGround(sx: number, sy: number): [number, number] {
-    const k = this.W / this.canvas.clientWidth;
-    const X = this.cam.x + (sx * k - this.W / 2) / this.cam.ppm;
-    const Yp = this.cam.y + (sy * k - this.H / 2) / this.cam.ppm;
-    return [X, Yp / SIN];
+  // ------------------------------------------------------------ 镜头与坐标换算
+  private updateCamera() {
+    const d = CAM_DIST / this.zoom;
+    const cam = this.camera;
+    cam.position.set(this.focus.x, this.focus.y + Math.sin(PITCH) * d, this.focus.z + Math.cos(PITCH) * d);
+    if (this.shake > 0) {
+      const s = this.shake * this.shake * 0.22;
+      cam.position.x += (Math.random() - 0.5) * s; cam.position.y += (Math.random() - 0.5) * s;
+    }
+    cam.lookAt(this.focus.x, this.focus.y, this.focus.z);
+    cam.near = Math.max(0.5, d * 0.25); cam.far = d + 220;
+    cam.updateProjectionMatrix();
+    cam.updateMatrixWorld(true);
+    this.camRight.setFromMatrixColumn(cam.matrixWorld, 0);
+    this.camUp.setFromMatrixColumn(cam.matrixWorld, 1);
+  }
+
+  /** 屏幕 CSS 像素 → 高度为 y 的水平面上的世界坐标 [x, z] */
+  screenToGround(sx: number, sy: number, y = 0): [number, number] {
+    const cam = this.camera;
+    const v = this.tmp.set((sx / this.canvas.clientWidth) * 2 - 1, -((sy / this.canvas.clientHeight) * 2 - 1), 0.5).unproject(cam);
+    const o = cam.position;
+    v.sub(o);
+    const t = v.y < -1e-5 ? (y - o.y) / v.y : 400;
+    return [o.x + v.x * t, o.z + v.z * t];
   }
   /** 世界坐标 → 屏幕 CSS 像素 */
   worldToScreen(x: number, y: number, z: number): [number, number] {
-    const k = this.canvas.clientWidth / this.W;
-    return [((x - this.cam.x) * this.cam.ppm + this.W / 2) * k, ((z * SIN - y * COS - this.cam.y) * this.cam.ppm + this.H / 2) * k];
+    const v = this.tmp.set(x, y, z).applyMatrix4(this.camera.matrixWorldInverse);
+    if (v.z > -0.1) return [-9999, -9999];
+    v.applyMatrix4(this.camera.projectionMatrix);
+    return [(v.x * 0.5 + 0.5) * this.canvas.clientWidth, (0.5 - v.y * 0.5) * this.canvas.clientHeight];
   }
-  /** 可见范围（世界 x / z，含余量） */
+  /** 某个世界位置上 1 米对应多少 CSS 像素 */
+  pxPerMeter(x: number, y: number, z: number): number {
+    const d = this.tmp.set(x, y, z).distanceTo(this.camera.position);
+    return this.canvas.clientHeight / (2 * Math.tan((FOV * Math.PI) / 360) * Math.max(1, d));
+  }
+  /** 地面上的可见范围 [x0, z0, x1, z1]（含余量） */
   viewBounds(margin = 0): [number, number, number, number] {
-    const hw = this.W / 2 / this.cam.ppm + margin, hh = this.H / 2 / this.cam.ppm;
-    return [this.cam.x - hw, (this.cam.y - hh) / SIN - margin, this.cam.x + hw, (this.cam.y + hh) / SIN + margin];
+    const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
+    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+    for (const [sx, sy] of [[0, 0], [w, 0], [0, h], [w, h]]) {
+      const [x, z] = this.screenToGround(sx, sy);
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+    }
+    return [x0 - margin, z0 - margin, x1 + margin, z1 + margin];
   }
 
   // ------------------------------------------------------------ 每帧提交
   begin() {
-    this.sprites.n = 0; this.spriteCmds.length = 0;
-    this.emis.n = 0; this.emisCmds.length = 0;
-    this.shadows.n = 0; this.shadowCmds.length = 0;
     this.fxN = 0;
-    this.lightList.length = 0;
-  }
-
-  private pushInst(buf: InstBuf, atlasW: number, atlasH: number, fx: number, fy: number, fw: number, fh: number,
-    x0: number, y0: number, x1: number, y1: number, p0: number, p1: number, p2: number, p3: number,
-    r: number, g: number, b: number, a: number, flip: boolean): number {
-    buf.ensure();
-    const d = buf.data, o = buf.n * INST;
-    d[o] = x0; d[o + 1] = y0; d[o + 2] = x1; d[o + 3] = y1;
-    const u0 = fx / atlasW, u1 = (fx + fw) / atlasW;
-    d[o + 4] = flip ? u1 : u0; d[o + 5] = fy / atlasH; d[o + 6] = flip ? u0 : u1; d[o + 7] = (fy + fh) / atlasH;
-    d[o + 8] = p0; d[o + 9] = p1; d[o + 10] = p2; d[o + 11] = p3;
-    d[o + 12] = r; d[o + 13] = g; d[o + 14] = b; d[o + 15] = a;
-    return buf.n++;
+    this.reqs.length = 0;
   }
 
   /**
-   * 提交一个世界精灵。x/y/z 为锚点世界坐标，scale 为缩放。
-   * opts: tint 颜色乘子，alpha，flash 受击闪白 0..1，flip 水平镜像，shadow 是否投影（'static' | 'dynamic' | false），sortBias 排序偏移
+   * 提交一盏点光源。key 用来在帧间认出同一盏灯（阴影槽位据此保持稳定）；
+   * shadow 表示它值得投影（离镜头近时才会真的分到带阴影的槽位）。
    */
-  sprite(atlas: Atlas, frame: FrameMeta, x: number, y: number, z: number, scale = 1,
-    o: { tint?: [number, number, number]; alpha?: number; flash?: number; flip?: boolean; shadow?: 'static' | 'dynamic' | false; sortBias?: number; shadowK?: number; emissive?: number } = {}) {
-    const m = atlas.meta, k = scale / m.ppu;
-    const yp = z * SIN - y * COS;
-    const [fx, fy, fw, fh] = frame.r, [ax, ay] = frame.a;
-    const flip = !!o.flip;
-    const x0 = flip ? x - (fw - ax) * k : x - ax * k;
-    const t = o.tint;
-    const off = this.pushInst(this.sprites, m.size[0], m.size[1], fx, fy, fw, fh,
-      x0, yp - ay * k, x0 + fw * k, yp + (fh - ay) * k,
-      y, m.hScale * scale, flip ? -1 : 1, o.flash ?? 0,
-      t ? t[0] : 1, t ? t[1] : 1, t ? t[2] : 1, o.alpha ?? 1, flip);
-    this.spriteCmds.push({ key: z + (o.sortBias ?? 0), atlas, off });
-    if (o.shadow !== false && frame.s && atlas.shadow && m.shadowSize) {
-      const [sx, sy, sw, sh, sax, say] = frame.s;
-      const sk = scale / (m.shadowPpu ?? m.ppu / 2);
-      const gy = z * SIN;
-      const sx0 = flip ? x - (sw - sax) * sk : x - sax * sk;
-      const so = this.pushInst(this.shadows, m.shadowSize[0], m.shadowSize[1], sx, sy, sw, sh,
-        sx0, gy - say * sk, sx0 + sw * sk, gy + (sh - say) * sk,
-        o.shadow === 'static' ? 1 : 0, (o.shadowK ?? 1) * (o.alpha ?? 1), 0, 0, 1, 1, 1, 1, flip);
-      this.shadowCmds.push({ key: 0, atlas, off: so });
-    }
-    if (frame.e && (o.emissive ?? 0) > 0.01) {
-      const [ex, ey, ew, eh, eax, eay] = frame.e;
-      const e = o.emissive!;
-      const ex0 = flip ? x - (ew - eax) * k : x - eax * k;
-      const eo = this.pushInst(this.emis, m.size[0], m.size[1], ex, ey, ew, eh,
-        ex0, yp - eay * k, ex0 + ew * k, yp + (eh - eay) * k,
-        y, m.hScale * scale, flip ? -1 : 1, 0, e, e, e, 1, flip);
-      this.emisCmds.push({ key: z, atlas, off: eo });
+  light(key: string, x: number, y: number, z: number, radius: number, c: V3, k = 1, shadow = false) {
+    if (k <= 0.004) return;
+    const dx = x - this.focus.x, dz = z - this.focus.z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 > (42 + radius) * (42 + radius)) return;
+    const lum = c[0] + c[1] + c[2];
+    // 只有离注视点够近的灯才值得投影：远处的影子看不见，却要整整渲染六个面
+    this.reqs.push({ key, x, y, z, r: radius, c, k, shadow: shadow && d2 < 26 * 26, score: (lum * k * radius) / (9 + d2) });
+  }
+
+  private commitLights(dt: number) {
+    const reqs = this.reqs, slots = this.slots;
+    const cur = new Map<string, Slot>();
+    for (const s of slots) if (s.key) cur.set(s.key, s);
+    for (const q of reqs) if (cur.has(q.key)) q.score *= 1.35;
+    reqs.sort((a, b) => b.score - a.score);
+    const wantShadow = reqs.filter((q) => q.shadow).slice(0, N_SHADOW);
+    const ws = new Set(wantShadow.map((q) => q.key));
+    const wantPlain = reqs.filter((q) => !ws.has(q.key)).slice(0, N_PLAIN);
+    for (const s of slots) s.req = null;
+    const assign = (list: LightReq[], shadow: boolean) => {
+      const pending: LightReq[] = [];
+      for (const q of list) {
+        const s = cur.get(q.key);
+        if (s && s.shadow === shadow) s.req = q; else pending.push(q);
+      }
+      for (const q of pending) {
+        const free = slots.find((s) => s.shadow === shadow && s.key === null);
+        if (free) { free.key = q.key; free.req = q; free.fade = 0; }
+      }
+    };
+    assign(wantShadow, true);
+    assign(wantPlain, false);
+    this.fogLightN = 0;
+    for (const s of slots) {
+      const l = s.light, q = s.req;
+      if (q) {
+        s.fade = Math.min(1, s.fade + dt * 6);
+        l.position.set(q.x, q.y, q.z);
+        l.distance = q.r;
+        l.color.setRGB(q.c[0], q.c[1], q.c[2]);
+        l.intensity = q.k * s.fade * PI * POINT_K;
+      } else if (s.key) {
+        s.fade -= dt * 6;
+        if (s.fade <= 0) { s.fade = 0; s.key = null; l.intensity = 0; l.position.y = -50; }
+        else l.intensity *= Math.max(0, 1 - dt * 6 / Math.max(0.05, s.fade + dt * 6));
+      }
+      if (s.shadow) l.shadow.camera.far = Math.max(1, l.distance);
+      if (l.intensity > 0 && this.fogLightN < FOG_LIGHTS) {
+        const i = this.fogLightN++;
+        this.fogLightPos.set([l.position.x, l.position.y, l.position.z, l.distance], i * 4);
+        const k = l.intensity / (PI * POINT_K);
+        this.fogLightCol.set([l.color.r * k, l.color.g * k, l.color.b * k], i * 3);
+      }
     }
   }
 
-  light(x: number, y: number, z: number, radius: number, c: [number, number, number], k = 1) {
-    const [x0, z0, x1, z1] = this.viewBounds(radius);
-    if (x < x0 || x > x1 || z < z0 - radius || z > z1 + radius) return;
-    const lum = (c[0] + c[1] + c[2]) * k * radius;
-    this.lightList.push({ x, y, z, r: radius, c: [c[0] * k, c[1] * k, c[2] * k], w: lum });
+  /**
+   * 点光源的阴影贴图轮流更新：离注视点最近的那盏每帧都更新（主角的影子不能卡），其余的隔帧轮换。
+   * 一盏灯的阴影要渲染立方体的六个面，三盏全更新就是每帧十八遍场景。
+   */
+  private updatePointShadows() {
+    const act = this.slots.filter((s) => s.shadow && s.light.intensity > 0);
+    for (const s of this.slots) if (s.shadow) s.light.shadow.needsUpdate = false;
+    if (!act.length) return;
+    const d2 = (s: Slot) => (s.light.position.x - this.focus.x) ** 2 + (s.light.position.z - this.focus.z) ** 2;
+    act.sort((a, b) => d2(a) - d2(b));
+    act[0].light.shadow.needsUpdate = true;
+    if (act.length > 1) act[1 + (this.frame % (act.length - 1))].light.shadow.needsUpdate = true;
+    // 刚分到槽位的灯必须先渲染一次，否则会带着上一盏灯的影子亮起来
+    for (const s of act) if (s.fade < 0.2) s.light.shadow.needsUpdate = true;
   }
 
-  /** 特效四边形：四角世界坐标（左上、右上、左下、右下），cell 为特效图集格子，颜色为线性 RGB，add=1 纯加色 */
-  fxQuad(p: number[], cell: number, r: number, g: number, b: number, alpha: number, add = 1) {
-    if (this.fxN >= 8192) return;
-    if ((this.fxN + 1) * 36 > this.fxData.length) {
-      const d = new Float32Array(this.fxData.length * 2); d.set(this.fxData); this.fxData = d;
-    }
-    const d = this.fxData;
-    const cu = (cell % 4) * 0.25, cv = Math.floor(cell / 4) * 0.5;
-    const pad = 0.004;
-    const uv = [cu + pad, cv + pad, cu + 0.25 - pad, cv + pad, cu + pad, cv + 0.5 - pad, cu + 0.25 - pad, cv + 0.5 - pad];
-    let o = this.fxN * 36;
+  /** 特效四边形：四角世界坐标（左上、右上、左下、右下）。颜色为线性 RGB，add=1 纯加色；a1 给定时左右两侧不透明度分别为 alpha 与 a1 */
+  fxQuad(p: number[], cell: number, r: number, g: number, b: number, alpha: number, add = 1, a1 = alpha) {
+    if (this.fxN >= Renderer.FX_MAX) return;
+    const cu = (cell % 4) * 0.25, cv = 1 - Math.floor(cell / 4) / 3;
+    const pad = 0.004, ch = 1 / 3;
+    const u0 = cu + pad, u1 = cu + 0.25 - pad, v0 = cv - pad, v1 = cv - ch + pad;
+    const o = this.fxN * 4;
+    const P = this.fxPos.array as Float32Array, U = this.fxUv.array as Float32Array, C = this.fxCol.array as Float32Array;
     for (let i = 0; i < 4; i++) {
-      const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
-      d[o++] = x; d[o++] = z * SIN - y * COS; d[o++] = z + 0.06;
-      d[o++] = uv[i * 2]; d[o++] = uv[i * 2 + 1];
-      d[o++] = r * alpha; d[o++] = g * alpha; d[o++] = b * alpha; d[o++] = alpha * (1 - add);
+      P[(o + i) * 3] = p[i * 3]; P[(o + i) * 3 + 1] = p[i * 3 + 1]; P[(o + i) * 3 + 2] = p[i * 3 + 2];
+      U[(o + i) * 2] = i & 1 ? u1 : u0; U[(o + i) * 2 + 1] = i & 2 ? v1 : v0;
+      const a = i & 1 ? a1 : alpha;
+      C[(o + i) * 4] = r * a; C[(o + i) * 4 + 1] = g * a; C[(o + i) * 4 + 2] = b * a; C[(o + i) * 4 + 3] = a * (1 - add);
     }
     this.fxN++;
   }
 
   /** 面向镜头的粒子 */
   fxBillboard(x: number, y: number, z: number, size: number, cell: number, r: number, g: number, b: number, alpha: number, add = 1, rot = 0) {
-    const s = size / 2;
-    const c = Math.cos(rot) * s, sn = Math.sin(rot) * s;
-    // 屏幕平面内的两个轴：右 = (1,0,0)，上 = (0,COS,-SIN)
-    const ax = [c, sn * COS, -sn * SIN], ay = [-sn, c * COS, -c * SIN];
+    const s = size / 2, c = Math.cos(rot) * s, sn = Math.sin(rot) * s;
+    const R = this.camRight, U = this.camUp;
+    const ax = R.x * c + U.x * sn, ay = R.y * c + U.y * sn, az = R.z * c + U.z * sn;
+    const bx = -R.x * sn + U.x * c, by = -R.y * sn + U.y * c, bz = -R.z * sn + U.z * c;
     this.fxQuad([
-      x - ax[0] + ay[0], y - ax[1] + ay[1], z - ax[2] + ay[2],
-      x + ax[0] + ay[0], y + ax[1] + ay[1], z + ax[2] + ay[2],
-      x - ax[0] - ay[0], y - ax[1] - ay[1], z - ax[2] - ay[2],
-      x + ax[0] - ay[0], y + ax[1] - ay[1], z + ax[2] - ay[2],
+      x - ax + bx, y - ay + by, z - az + bz, x + ax + bx, y + ay + by, z + az + bz,
+      x - ax - bx, y - ay - by, z - az - bz, x + ax - bx, y + ay - by, z + az - bz,
     ], cell, r, g, b, alpha, add);
   }
 
-  /** 水平面上的贴片（刀光、脚下光环等），rot 为绕 Y 的朝向角 */
+  /** 水平面上的贴片（脚下光环、点击标记等），rot 为绕 Y 的朝向角 */
   fxFlat(x: number, y: number, z: number, w: number, d: number, rot: number, cell: number, r: number, g: number, b: number, alpha: number, add = 1) {
     const c = Math.cos(rot), s = Math.sin(rot);
     const hx = w / 2, hz = d / 2;
@@ -416,177 +345,211 @@ export class Renderer {
   }
 
   // ------------------------------------------------------------ 渲染
-  private drawInst(buf: InstBuf, cmds: SpriteCmd[], prog: Program, shadowTex = false) {
-    const gl = this.gl;
-    if (!cmds.length) return;
-    // 把排序后的实例重排到连续缓冲
-    const out = new Float32Array(cmds.length * INST);
-    for (let i = 0; i < cmds.length; i++) out.set(buf.data.subarray(cmds[i].off * INST, cmds[i].off * INST + INST), i * INST);
-    gl.bindVertexArray(this.vaoInst);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instVbo);
-    gl.bufferData(gl.ARRAY_BUFFER, out, gl.DYNAMIC_DRAW);
-    let start = 0;
-    while (start < cmds.length) {
-      const atlas = cmds[start].atlas;
-      let end = start + 1;
-      while (end < cmds.length && cmds[end].atlas === atlas) end++;
-      if (shadowTex) prog.tex('uColor', 0, atlas.shadow);
-      else { prog.tex('uColor', 0, atlas.color); prog.tex('uNormal', 1, atlas.normal); }
-      for (let i = 0; i < 4; i++) gl.vertexAttribPointer(i, 4, gl.FLOAT, false, INST * 4, start * INST * 4 + i * 16);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, end - start);
-      start = end;
-    }
-    gl.bindVertexArray(null);
-  }
-
   render(env: Env, dt: number) {
-    const gl = this.gl, W = this.W, H = this.H;
     this.time += dt;
-    const cam = this.cam;
-    // 镜头对齐像素，避免精灵抖动
-    const cx = Math.round(cam.x * cam.ppm) / cam.ppm, cy = Math.round(cam.y * cam.ppm) / cam.ppm;
-    const R = H / 2 / cam.ppm / SIN + 24;
-    const zNear = cy / SIN + R, dK = 1 / (2 * R);
-    const setCam = (p: Program) => { p.v4('uCam', cx, cy, cam.ppm, 0).v2('uRes', W, H); };
+    this.uniforms.uTime.value = this.time;
+    this.updateCamera();
+    const cam = this.camera;
+    this.uniforms.uHoleA.value.copy(cam.position);
 
-    // ---- G-Buffer ----
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fGbuf);
-    gl.viewport(0, 0, W, H);
-    gl.disable(gl.BLEND);
-    gl.enable(gl.DEPTH_TEST);
-    gl.depthFunc(gl.LEQUAL);
-    gl.depthMask(true);
-    gl.clearColor(0.02, 0.03, 0.02, 1);
-    gl.clearDepth(1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (this.ground) {
-      const g = this.ground, p = this.pGround.use();
-      setCam(p);
-      p.v4('uMap', 1 / g.mapW, 1 / g.mapH, 0, 0).v2('uDepth', zNear, dK);
-      p.tex('uSplat', 0, g.splat).tex('uAux', 1, g.aux).tex('uNoise', 2, this.noise);
-      p.tex('uTileC', 3, g.tileC, gl.TEXTURE_2D_ARRAY).tex('uTileN', 4, g.tileN, gl.TEXTURE_2D_ARRAY);
-      gl.bindVertexArray(this.vaoEmpty);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    this.spriteCmds.sort((a, b) => a.key - b.key || a.atlas.id - b.atlas.id);
-    {
-      const p = this.pSprite.use();
-      setCam(p);
-      p.v2('uDepth', zNear, dK);
-      this.drawInst(this.sprites, this.spriteCmds, p);
+    // 主光：阴影相机跟随注视点，并按阴影贴图的像素对齐，避免移动时闪烁
+    const dir = this.sunDirV.set(env.sunDir[0], env.sunDir[1], env.sunDir[2]).normalize();
+    const sun = this.sun;
+    const ext = Math.min(70, 30 / this.zoom + 8);
+    const sc = sun.shadow.camera;
+    sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext; sc.near = 1; sc.far = 320;
+    sc.updateProjectionMatrix();
+    const lookM = new THREE.Matrix4().lookAt(dir, new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 1, 0));
+    const rx = this.tmp.setFromMatrixColumn(lookM, 0), ry = this.tmp2.setFromMatrixColumn(lookM, 1);
+    const texel = (ext * 2) / sun.shadow.mapSize.x;
+    const fx = Math.round(this.focus.dot(rx) / texel) * texel, fy = Math.round(this.focus.dot(ry) / texel) * texel;
+    const fz = this.focus.dot(dir);
+    sun.target.position.set(0, 0, 0).addScaledVector(rx, fx).addScaledVector(ry, fy).addScaledVector(dir, fz);
+    sun.position.copy(sun.target.position).addScaledVector(dir, 160);
+    sun.target.updateMatrixWorld();
+    sun.color.setRGB(env.sunCol[0], env.sunCol[1], env.sunCol[2]);
+    sun.intensity = PI;
+    this.hemi.color.setRGB(env.ambSky[0], env.ambSky[1], env.ambSky[2]);
+    this.hemi.groundColor.setRGB(env.ambGnd[0], env.ambGnd[1], env.ambGnd[2]);
+    this.hemi.intensity = PI;
+    this.scene.environmentIntensity = env.envK;
+    if (Math.abs(env.night - this.lastNight) > 0.01) {
+      this.lastNight = env.night;
+      for (const m of EMISSIVE_MATS) m.emissiveIntensity = env.night * 1.25;
     }
 
-    // ---- 阴影遮罩 ----
-    gl.disable(gl.DEPTH_TEST);
-    gl.depthMask(false);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fSh[0]);
-    gl.viewport(0, 0, this.shW, this.shH);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.blendEquation(gl.MAX);
-    gl.blendFunc(gl.ONE, gl.ONE);
-    {
-      const p = this.pShadow.use();
-      setCam(p);
-      this.shadowCmds.sort((a, b) => a.atlas.id - b.atlas.id);
-      this.drawInst(this.shadows, this.shadowCmds, p, true);
-    }
-    gl.blendEquation(gl.FUNC_ADD);
-    gl.disable(gl.BLEND);
-    gl.bindVertexArray(this.vaoEmpty);
-    {
-      const p = this.pBlur.use();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fSh[1]);
-      p.tex('uTex', 0, this.tSh[0]).v2('uDir', 0.6 / this.shW, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fSh[0]);
-      p.tex('uTex', 0, this.tSh[1]).v2('uDir', 0, 0.6 / this.shH);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
+    this.commitLights(dt);
+    this.frame++;
+    this.updatePointShadows();
 
-    // ---- 光照 ----
-    this.lightList.sort((a, b) => b.w - a.w);
-    const nL = Math.min(MAX_LIGHTS, this.lightList.length);
-    for (let i = 0; i < nL; i++) {
-      const l = this.lightList[i];
-      this.lightPos.set([l.x, l.y, l.z, l.r], i * 4);
-      this.lightCol.set([l.c[0], l.c[1], l.c[2], 0], i * 4);
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fHdr);
-    gl.viewport(0, 0, W, H);
-    {
-      const p = this.pLight.use();
-      setCam(p);
-      const g = this.ground;
-      p.v4('uMap', g ? 1 / g.mapW : 1, g ? 1 / g.mapH : 1, 0, 0);
-      p.tex('uAlbedo', 0, this.tAlbedo).tex('uNormalH', 1, this.tNormal).tex('uShadow', 2, this.tSh[0]).tex('uNoise', 3, this.noise);
-      p.tex('uAux', 4, g ? g.aux : this.noise).tex('uMat', 5, this.tMat);
-      p.v3('uSunDir', ...env.sunDir).v3('uSunCol', ...env.sunCol).v3('uAmbSky', ...env.ambSky).v3('uAmbGnd', ...env.ambGnd).v3('uSkyRefl', ...env.skyRefl);
-      p.f('uTime', this.time).f('uShadowK', env.shadowK).i('uNumLights', nL);
-      p.fv4('uLightPos[0]', this.lightPos).fv4('uLightCol[0]', this.lightCol);
-      p.v4('uFog', ...env.fog);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
-
-    // ---- 自发光与特效（带深度测试，不写深度） ----
-    gl.enable(gl.DEPTH_TEST);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    if (this.emisCmds.length) {
-      const p = this.pEmis.use();
-      setCam(p);
-      p.v2('uDepth', zNear, dK);
-      this.emisCmds.sort((a, b) => a.atlas.id - b.atlas.id);
-      this.drawInst(this.emis, this.emisCmds, p);
-    }
+    this.fxGeo.setDrawRange(0, this.fxN * 6);
     if (this.fxN) {
-      const p = this.pFx.use();
-      setCam(p);
-      p.v2('uDepth', zNear, dK).tex('uTex', 0, this.fxTex);
-      gl.bindVertexArray(this.vaoFx);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.fxVbo);
-      gl.bufferData(gl.ARRAY_BUFFER, this.fxData.subarray(0, this.fxN * 36), gl.DYNAMIC_DRAW);
-      gl.drawElements(gl.TRIANGLES, this.fxN * 6, gl.UNSIGNED_SHORT, 0);
-    }
-    gl.disable(gl.DEPTH_TEST);
-    gl.disable(gl.BLEND);
-    gl.bindVertexArray(this.vaoEmpty);
-
-    // ---- 泛光 ----
-    {
-      const p = this.pDown.use();
-      let src = this.tHdr, sw = W, sh = H;
-      for (let i = 0; i < this.bloomT.length; i++) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomF[i]);
-        gl.viewport(0, 0, this.bloomS[i][0], this.bloomS[i][1]);
-        p.tex('uTex', 0, src).v2('uTexel', 1 / sw, 1 / sh).f('uThreshold', i === 0 ? 1.0 : 0);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
-        src = this.bloomT[i]; [sw, sh] = this.bloomS[i];
-      }
-      const u = this.pUp.use();
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.ONE, gl.ONE);
-      for (let i = this.bloomT.length - 1; i > 0; i--) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomF[i - 1]);
-        gl.viewport(0, 0, this.bloomS[i - 1][0], this.bloomS[i - 1][1]);
-        u.tex('uTex', 0, this.bloomT[i]).v2('uTexel', 1 / this.bloomS[i][0], 1 / this.bloomS[i][1]);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
-      }
-      gl.disable(gl.BLEND);
+      for (const a of [this.fxPos, this.fxUv, this.fxCol]) { a.clearUpdateRanges(); a.addUpdateRange(0, this.fxN * 4 * a.itemSize); a.needsUpdate = true; }
     }
 
-    // ---- 合成 ----
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, W, H);
-    {
-      const p = this.pComp.use();
-      p.tex('uHdr', 0, this.tHdr).tex('uBloom', 1, this.bloomT[0]);
-      p.tex('uDbg', 2, this.debug === 1 ? this.tSh[0] : this.debug === 2 ? this.tAlbedo : this.tNormal).f('uDebug', this.debug);
-      p.f('uBloomK', env.bloom).f('uExposure', env.exposure).f('uSat', env.sat).f('uTime', this.time).f('uVignette', env.vignette);
-      p.v3('uTint', ...env.tint);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const gl = this.gl;
+    gl.info.reset();
+    gl.setRenderTarget(this.post.rtScene);
+    gl.setClearColor(new THREE.Color(env.fogCol[0] * 0.6, env.fogCol[1] * 0.6, env.fogCol[2] * 0.6), 1);
+    gl.clear();
+    gl.render(this.scene, cam);
+
+    this.post.render({
+      camera: cam, sun, sunDir: dir,
+      sunCol: new THREE.Color(env.sunCol[0], env.sunCol[1], env.sunCol[2]),
+      fogCol: new THREE.Color(env.fogCol[0], env.fogCol[1], env.fogCol[2]),
+      fogDensity: env.fogDensity, fogFalloff: env.fogFalloff, shaftK: env.shaftK, glowK: 0.3, aoK: 0.95,
+      bloom: env.bloom, exposure: env.exposure, sat: env.sat, contrast: env.contrast,
+      tint: new THREE.Color(env.tint[0], env.tint[1], env.tint[2]), vignette: env.vignette, time: this.time,
+      numLights: this.fogLightN, lightPos: this.fogLightPos, lightCol: this.fogLightCol, debug: this.debug,
+    });
+  }
+}
+
+// ---------------------------------------------------------------- 资源
+/** 可平铺的四通道分形噪声 */
+function makeNoise(): THREE.DataTexture {
+  const S = 256;
+  const data = new Uint8Array(S * S * 4);
+  const lattice = (seed: number, period: number) => {
+    const g = new Float32Array(period * period);
+    let s = seed;
+    for (let i = 0; i < g.length; i++) { s = (s * 1664525 + 1013904223) >>> 0; g[i] = s / 4294967296; }
+    return (x: number, y: number) => {
+      const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+      const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+      const p = (a: number, b: number) => g[(((b % period) + period) % period) * period + (((a % period) + period) % period)];
+      return p(xi, yi) * (1 - u) * (1 - v) + p(xi + 1, yi) * u * (1 - v) + p(xi, yi + 1) * (1 - u) * v + p(xi + 1, yi + 1) * u * v;
+    };
+  };
+  const P = [4, 8, 16, 32];
+  for (let c = 0; c < 4; c++) {
+    const octs = P.map((p, i) => lattice(977 + c * 131 + i * 17, p));
+    for (let y = 0; y < S; y++) {
+      for (let x = 0; x < S; x++) {
+        let v = 0, amp = 0.5, tot = 0;
+        octs.forEach((f, i) => { v += f((x / S) * P[i], (y / S) * P[i]) * amp; tot += amp; amp *= 0.5; });
+        v /= tot;
+        data[(y * S + x) * 4 + c] = Math.min(255, Math.max(0, ((v - 0.5) * 1.9 + 0.5) * 255));
+      }
     }
   }
+  const t = new THREE.DataTexture(data, S, S, THREE.RGBAFormat, THREE.UnsignedByteType);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.minFilter = THREE.LinearMipmapLinearFilter; t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = true;
+  t.needsUpdate = true;
+  return t;
+}
+
+/**
+ * 特效小图集（4×3 格，每格 128px）：
+ * 0 柔光圆 1 火星 2 烟团 3 弧形刃光 4 圆环 5 叶片 6 花瓣 7 实心圆 8 刀光拖尾（纵向渐隐）9 细长火花
+ */
+function makeFxTex(): THREE.CanvasTexture {
+  const C = 128;
+  const cv = document.createElement('canvas');
+  cv.width = C * 4; cv.height = C * 3;
+  const g = cv.getContext('2d')!;
+  const cell = (i: number, fn: (cx: number, cy: number) => void) => {
+    g.save();
+    g.beginPath(); g.rect((i % 4) * C, Math.floor(i / 4) * C, C, C); g.clip();
+    fn((i % 4) * C + C / 2, Math.floor(i / 4) * C + C / 2);
+    g.restore();
+  };
+  const radial = (x: number, y: number, stops: [number, number][]) => {
+    const r = g.createRadialGradient(x, y, 0, x, y, C / 2);
+    for (const [t, a] of stops) r.addColorStop(t, `rgba(255,255,255,${a})`);
+    g.fillStyle = r; g.fillRect(x - C / 2, y - C / 2, C, C);
+  };
+  cell(0, (x, y) => radial(x, y, [[0, 1], [0.25, 0.55], [0.6, 0.12], [1, 0]]));
+  cell(1, (x, y) => radial(x, y, [[0, 1], [0.12, 0.9], [0.3, 0.15], [1, 0]]));
+  cell(2, (x, y) => {
+    for (let i = 0; i < 9; i++) {
+      const a = i * 2.4, d = i ? 18 + (i % 3) * 7 : 0, rr = 30 - (i % 4) * 4;
+      const cx = x + Math.cos(a) * d, cy = y + Math.sin(a) * d;
+      const r = g.createRadialGradient(cx, cy, 0, cx, cy, rr);
+      r.addColorStop(0, 'rgba(255,255,255,0.5)'); r.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = r; g.fillRect(cx - rr, cy - rr, rr * 2, rr * 2);
+    }
+  });
+  cell(3, (x, y) => {
+    // 细而利的弧：外缘一道亮线，向内很快隐去
+    for (let i = 0; i < 16; i++) {
+      const t = i / 15;
+      g.beginPath();
+      g.arc(x, y + 34, 86 - t * 14, Math.PI * 1.17, Math.PI * 1.83);
+      g.strokeStyle = `rgba(255,255,255,${Math.pow(1 - t, 3) * 0.7})`;
+      g.lineWidth = 1.6;
+      g.stroke();
+    }
+    const m = g.createLinearGradient(x - C / 2, 0, x + C / 2, 0);
+    m.addColorStop(0, 'rgba(0,0,0,1)'); m.addColorStop(0.35, 'rgba(0,0,0,0)'); m.addColorStop(0.65, 'rgba(0,0,0,0)'); m.addColorStop(1, 'rgba(0,0,0,1)');
+    g.globalCompositeOperation = 'destination-out';
+    g.fillStyle = m; g.fillRect(x - C / 2, y - C / 2, C, C);
+    g.globalCompositeOperation = 'source-over';
+  });
+  cell(4, (x, y) => {
+    for (let i = 0; i < 6; i++) {
+      g.beginPath(); g.arc(x, y, 54 - i * 1.0, 0, Math.PI * 2);
+      g.strokeStyle = `rgba(255,255,255,${0.5 - Math.abs(i - 2) * 0.12})`; g.lineWidth = 1.4; g.stroke();
+    }
+  });
+  cell(5, (x, y) => {
+    g.translate(x, y); g.rotate(0.5);
+    g.beginPath(); g.moveTo(-44, 0); g.quadraticCurveTo(0, -30, 44, 0); g.quadraticCurveTo(0, 30, -44, 0);
+    g.fillStyle = 'rgba(255,255,255,1)'; g.fill();
+    g.beginPath(); g.moveTo(-40, 0); g.lineTo(40, 0); g.strokeStyle = 'rgba(160,160,160,1)'; g.lineWidth = 3; g.stroke();
+  });
+  cell(6, (x, y) => {
+    g.translate(x, y);
+    g.beginPath(); g.moveTo(0, -40); g.bezierCurveTo(34, -30, 30, 26, 0, 40); g.bezierCurveTo(-30, 26, -34, -30, 0, -40);
+    const r = g.createLinearGradient(0, -40, 0, 40);
+    r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(1, 'rgba(215,215,215,1)');
+    g.fillStyle = r; g.fill();
+  });
+  cell(7, (x, y) => { g.beginPath(); g.arc(x, y, 56, 0, Math.PI * 2); g.fillStyle = '#fff'; g.fill(); });
+  cell(8, (x, y) => {
+    // 拖尾：上缘（刃尖一侧）最亮，向刃根渐隐
+    const r = g.createLinearGradient(0, y - C / 2, 0, y + C / 2);
+    r.addColorStop(0, 'rgba(255,255,255,0)'); r.addColorStop(0.05, 'rgba(255,255,255,1)'); r.addColorStop(0.16, 'rgba(255,255,255,0.3)');
+    r.addColorStop(0.5, 'rgba(255,255,255,0.06)'); r.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = r; g.fillRect(x - C / 2, y - C / 2, C, C);
+  });
+  cell(9, (x, y) => {
+    const r = g.createLinearGradient(x - C / 2, 0, x + C / 2, 0);
+    r.addColorStop(0, 'rgba(255,255,255,0)'); r.addColorStop(0.8, 'rgba(255,255,255,1)'); r.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = r; g.fillRect(x - C / 2, y - 3, C, 6);
+  });
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.NoColorSpace;
+  t.premultiplyAlpha = false;
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  return t;
+}
+
+/** 环境贴图：一片灰白的阴天天穹，只为给金属与湿润表面提供可反射的东西 */
+function makeEnvMap(gl: THREE.WebGLRenderer): THREE.Texture {
+  const s = new THREE.Scene();
+  const m = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: `varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float h = d.y;
+        vec3 sky = mix(vec3(0.95, 0.97, 1.0), vec3(0.42, 0.5, 0.62), smoothstep(0.0, 0.9, h));
+        vec3 gnd = vec3(0.07, 0.065, 0.06);
+        vec3 c = mix(gnd, sky, smoothstep(-0.08, 0.06, h));
+        // 一块更亮的云隙，给刀刃留一道可以「闪」的高光
+        c += vec3(2.6, 2.4, 2.1) * pow(max(dot(d, normalize(vec3(-0.45, 0.75, 0.35))), 0.0), 24.0);
+        gl_FragColor = vec4(c, 1.0);
+      }`,
+  });
+  s.add(new THREE.Mesh(new THREE.SphereGeometry(10, 32, 16), m));
+  const pm = new THREE.PMREMGenerator(gl);
+  const tex = pm.fromScene(s, 0.02, 0.1, 100).texture;
+  pm.dispose();
+  return tex;
 }

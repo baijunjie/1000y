@@ -1,49 +1,58 @@
-import { loadAtlas, loadGround } from './engine/assets';
+import { Actors } from './engine/actors';
 import { Audio } from './engine/audio';
-import type { Atlas } from './engine/renderer';
+import { buildGround } from './engine/ground';
 import { Renderer } from './engine/renderer';
+import { Statics } from './engine/statics';
 import { Game } from './game/game';
 import { MapData, World } from './game/world';
+import { loadPbr } from './models/geo';
+import { STATIC_MAKERS } from './models/registry';
 import { Overlay } from './ui/overlay';
 import './ui/style.css';
 import { UI } from './ui/ui';
 
-/** 进入游戏前必须就绪的图集：场景、NPC、村里的木人桩与鸡 */
-const ATLASES = ['env_trees', 'env_trees2', 'env_nature', 'env_build', 'env_build2', 'env_props', 'npcs', 'mob_dummy', 'mob_chicken'];
-/** 野外怪物：进入游戏后在后台依次加载（由近及远），加载完即刷出 */
-const DEFERRED = ['mob_wolf', 'mob_deer', 'mob_boar', 'mob_bandit', 'mob_bandit_spear', 'mob_bandit_bow', 'mob_tiger', 'mob_boss'];
-
 const $ = (id: string) => document.getElementById(id)!;
 const q = new URLSearchParams(location.search);
+const nextFrame = () => new Promise<void>((res) => setTimeout(res, 0));
 
 async function boot() {
   const canvas = $('game') as HTMLCanvasElement;
   const fill = $('boot-fill'), tip = $('boot-tip');
   if (q.has('nosave')) Game.clearSave();
-  const r = new Renderer(canvas);
-  let done = 0;
-  const total = ATLASES.length + 3;
-  const step = (label: string) => { done++; fill.style.width = `${(done / total) * 100}%`; tip.textContent = label; };
+  const r = new Renderer(canvas, {
+    samples: q.has('msaa') ? +q.get('msaa')! : undefined,
+    shadowLights: q.has('sl') ? +q.get('sl')! : undefined, plainLights: q.has('pl') ? +q.get('pl')! : undefined,
+  });
+  if (q.has('scale')) r.scale = +q.get('scale')!;
+  const progress = (k: number, label: string) => { fill.style.width = `${k * 100}%`; tip.textContent = label; };
 
   const map: MapData = await (await fetch(import.meta.env.BASE_URL + 'assets/map/world.json')).json();
-  step('展开舆图……');
-  const atlases: Record<string, Atlas> = {};
-  await Promise.all(ATLASES.map(async (name) => {
-    try { atlases[name] = await loadAtlas(r, name); } catch { /* 可选图集缺失时跳过 */ }
-    step('描摹山川草木……');
-  }));
-  r.ground = await loadGround(r, 'world', map.w, map.h);
-  step('铺陈大地……');
-  const world = new World(map, atlases);
-  const game = new Game(r, world, atlases, map);
-  await game.init();
-  step('万事俱备');
+  progress(0.05, '展开舆图……');
 
-  (async () => {
-    for (const name of DEFERRED) {
-      try { atlases[name] = await loadAtlas(r, name); game.spawnMobs(); } catch { /* 缺失的图集跳过 */ }
-    }
-  })();
+  await loadPbr();
+  progress(0.1, '研墨调色……');
+
+  // 每种物件建模一次（程序化生成，没有模型文件），之后全部走实例化渲染
+  const statics = new Statics(r);
+  const infos: Record<string, Record<string, any>> = {};
+  const keys = [...new Set([...map.objects.map((o) => o.k), ...map.gather.map((g) => g.k)])];
+  for (let i = 0; i < keys.length; i++) {
+    const mk = STATIC_MAKERS[keys[i]];
+    if (!mk) continue;
+    const m = mk();
+    infos[keys[i]] = m.info;
+    statics.addKind(keys[i], m.root, m.info);
+    if (i % 3 === 0) { progress(0.1 + 0.55 * (i / keys.length), '描摹山川草木……'); await nextFrame(); }
+  }
+  const world = new World(map, infos);
+  statics.place(world.placements);
+  progress(0.7, '铺陈大地……');
+  await buildGround(r, 'world', map.w, map.h);
+  progress(0.9, '点起灯火……');
+  const actors = new Actors(r);
+  const game = new Game(r, world, statics, actors, map);
+  await game.init();
+  progress(1, '万事俱备');
 
   const ui = new UI(game);
   $('ui').style.visibility = 'hidden';
@@ -53,9 +62,9 @@ async function boot() {
   ui.onVolume = (v) => audio.setVolume(v);
   (window as any).game = game;
 
-  if (q.has('x') && q.has('z')) { game.pe.x = +q.get('x')!; game.pe.z = +q.get('z')!; r.cam.x = game.pe.x; r.cam.y = game.pe.z * Math.SQRT1_2; }
+  if (q.has('x') && q.has('z')) { game.pe.x = +q.get('x')!; game.pe.z = +q.get('z')!; r.focus.set(game.pe.x, 0.9, game.pe.z); }
   if (q.has('hour')) game.hour = +q.get('hour')!;
-  if (q.has('zoom')) game.zoom = +q.get('zoom')!;
+  if (q.has('zoom')) { game.zoom = +q.get('zoom')!; r.zoom = game.zoom; }
 
   // ---------- 输入 ----------
   const pos = (e: MouseEvent) => { const b = canvas.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top] as const; };
@@ -76,7 +85,7 @@ async function boot() {
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
-    game.zoom = Math.min(1.3, Math.max(0.62, game.zoom * (e.deltaY > 0 ? 0.92 : 1.08)));
+    game.zoom = Math.min(2.2, Math.max(0.6, game.zoom * (e.deltaY > 0 ? 0.92 : 1.08)));
   }, { passive: false });
   window.addEventListener('keydown', (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;

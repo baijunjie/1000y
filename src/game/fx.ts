@@ -1,5 +1,4 @@
 import type { Env, Renderer } from '../engine/renderer';
-import { SUN_DIR } from '../shared/consts';
 
 export interface Particle {
   x: number; y: number; z: number;
@@ -18,7 +17,7 @@ export interface Particle {
   sway?: number;
 }
 
-export const FX = { GLOW: 0, SPARK: 1, SMOKE: 2, SLASH: 3, RING: 4, LEAF: 5, PETAL: 6, DOT: 7 };
+export const FX = { GLOW: 0, SPARK: 1, SMOKE: 2, SLASH: 3, RING: 4, LEAF: 5, PETAL: 6, DOT: 7, TRAIL: 8, STREAK: 9 };
 
 export class Particles {
   list: Particle[] = [];
@@ -60,23 +59,53 @@ export class Particles {
 
 // ---------------------------------------------------------------- 昼夜
 type V3 = [number, number, number];
-interface Key { h: number; sun: V3; sky: V3; gnd: V3; refl: V3; fog: [number, number, number, number]; night: number; shadow: number; exp: number; tint: V3; sat: number; }
+interface Key {
+  h: number; sun: V3; sky: V3; gnd: V3; envK: number; fog: V3; fogD: number; shaft: number;
+  night: number; exp: number; tint: V3; sat: number; contrast: number; bloom: number;
+}
 
+/** 日出与日落：这两个时刻主光强度压到近乎为零，日月在此交接（方向突变不可见） */
+const DAWN = 5.5, DUSK = 19;
+
+const NIGHT: Omit<Key, 'h'> = {
+  sun: [0.1, 0.15, 0.27], sky: [0.02, 0.028, 0.055], gnd: [0.008, 0.01, 0.016], envK: 0.06, fog: [0.02, 0.03, 0.06], fogD: 0.03, shaft: 0.6,
+  night: 1, exp: 1.3, tint: [0.94, 0.97, 1.08], sat: 0.8, contrast: 0.3, bloom: 0.8,
+};
+
+/**
+ * 整体基调偏暗：白天是阴沉、低饱和、明暗对比强的天光，黄昏与夜晚主要靠灯火。
+ * 环境光故意压得很低，暗部才沉得下去，灯火与日光光束才显得出来。
+ */
 const KEYS: Key[] = [
-  { h: 0, sun: [0.16, 0.22, 0.38], sky: [0.075, 0.1, 0.19], gnd: [0.03, 0.04, 0.07], refl: [0.1, 0.14, 0.26], fog: [0.1, 0.13, 0.22, 0.34], night: 1, shadow: 0.55, exp: 1.25, tint: [0.92, 0.97, 1.1], sat: 0.9 },
-  { h: 4.6, sun: [0.16, 0.22, 0.38], sky: [0.075, 0.1, 0.19], gnd: [0.03, 0.04, 0.07], refl: [0.1, 0.14, 0.26], fog: [0.1, 0.13, 0.22, 0.4], night: 1, shadow: 0.55, exp: 1.25, tint: [0.92, 0.97, 1.1], sat: 0.9 },
-  { h: 6.2, sun: [0.95, 0.52, 0.34], sky: [0.26, 0.26, 0.38], gnd: [0.1, 0.08, 0.1], refl: [0.75, 0.55, 0.5], fog: [0.62, 0.5, 0.5, 0.62], night: 0.35, shadow: 0.6, exp: 1.08, tint: [1.04, 0.98, 0.96], sat: 1 },
-  { h: 8.5, sun: [1.42, 1.24, 0.97], sky: [0.27, 0.33, 0.45], gnd: [0.16, 0.15, 0.12], refl: [0.6, 0.75, 0.95], fog: [0.7, 0.76, 0.82, 0.15], night: 0, shadow: 0.95, exp: 1, tint: [1, 1, 1], sat: 1.06 },
-  { h: 12.5, sun: [1.62, 1.5, 1.27], sky: [0.3, 0.37, 0.5], gnd: [0.18, 0.17, 0.13], refl: [0.55, 0.75, 1.0], fog: [0.75, 0.8, 0.86, 0.1], night: 0, shadow: 1, exp: 0.98, tint: [1, 1, 1], sat: 1.08 },
-  { h: 16.2, sun: [1.58, 1.2, 0.8], sky: [0.28, 0.31, 0.42], gnd: [0.18, 0.15, 0.11], refl: [0.75, 0.72, 0.8], fog: [0.82, 0.74, 0.62, 0.16], night: 0, shadow: 0.96, exp: 1, tint: [1.02, 1, 0.97], sat: 1.08 },
-  { h: 18.3, sun: [1.2, 0.56, 0.28], sky: [0.3, 0.25, 0.36], gnd: [0.14, 0.09, 0.09], refl: [0.95, 0.55, 0.4], fog: [0.75, 0.48, 0.4, 0.4], night: 0.3, shadow: 0.7, exp: 1.05, tint: [1.06, 0.98, 0.94], sat: 1.05 },
-  { h: 19.6, sun: [0.3, 0.26, 0.42], sky: [0.12, 0.13, 0.24], gnd: [0.05, 0.05, 0.08], refl: [0.2, 0.2, 0.36], fog: [0.2, 0.2, 0.32, 0.36], night: 0.9, shadow: 0.55, exp: 1.18, tint: [0.95, 0.97, 1.08], sat: 0.94 },
-  { h: 21, sun: [0.16, 0.22, 0.38], sky: [0.075, 0.1, 0.19], gnd: [0.03, 0.04, 0.07], refl: [0.1, 0.14, 0.26], fog: [0.1, 0.13, 0.22, 0.3], night: 1, shadow: 0.55, exp: 1.25, tint: [0.92, 0.97, 1.1], sat: 0.9 },
-  { h: 24, sun: [0.16, 0.22, 0.38], sky: [0.075, 0.1, 0.19], gnd: [0.03, 0.04, 0.07], refl: [0.1, 0.14, 0.26], fog: [0.1, 0.13, 0.22, 0.34], night: 1, shadow: 0.55, exp: 1.25, tint: [0.92, 0.97, 1.1], sat: 0.9 },
+  { h: 0, ...NIGHT },
+  { h: 4.6, ...NIGHT },
+  { h: DAWN, sun: [0.015, 0.015, 0.02], sky: [0.045, 0.05, 0.08], gnd: [0.016, 0.016, 0.022], envK: 0.1, fog: [0.06, 0.06, 0.09], fogD: 0.04, shaft: 0.5, night: 0.75, exp: 1.25, tint: [0.96, 0.98, 1.06], sat: 0.82, contrast: 0.3, bloom: 0.75 },
+  { h: 6.5, sun: [1.1, 0.55, 0.3], sky: [0.085, 0.085, 0.13], gnd: [0.035, 0.028, 0.03], envK: 0.18, fog: [0.16, 0.12, 0.11], fogD: 0.026, shaft: 1.0, night: 0.3, exp: 1.1, tint: [1.04, 0.98, 0.95], sat: 0.9, contrast: 0.34, bloom: 0.65 },
+  { h: 8.5, sun: [1.45, 1.22, 0.95], sky: [0.11, 0.135, 0.185], gnd: [0.045, 0.042, 0.035], envK: 0.24, fog: [0.14, 0.16, 0.18], fogD: 0.011, shaft: 1.3, night: 0, exp: 0.9, tint: [0.98, 1, 1.02], sat: 0.8, contrast: 0.4, bloom: 0.5 },
+  { h: 12.5, sun: [1.55, 1.42, 1.2], sky: [0.13, 0.155, 0.205], gnd: [0.052, 0.048, 0.04], envK: 0.27, fog: [0.17, 0.19, 0.21], fogD: 0.009, shaft: 1.1, night: 0, exp: 0.86, tint: [0.97, 1, 1.03], sat: 0.78, contrast: 0.42, bloom: 0.45 },
+  { h: 16.2, sun: [1.55, 1.12, 0.7], sky: [0.11, 0.12, 0.165], gnd: [0.05, 0.04, 0.032], envK: 0.24, fog: [0.17, 0.15, 0.12], fogD: 0.011, shaft: 1.4, night: 0, exp: 0.9, tint: [1.01, 1, 0.98], sat: 0.82, contrast: 0.4, bloom: 0.5 },
+  { h: 18.2, sun: [1.25, 0.5, 0.2], sky: [0.085, 0.068, 0.105], gnd: [0.035, 0.024, 0.024], envK: 0.18, fog: [0.17, 0.1, 0.07], fogD: 0.024, shaft: 1.1, night: 0.45, exp: 1.08, tint: [1.05, 0.98, 0.94], sat: 0.92, contrast: 0.34, bloom: 0.65 },
+  { h: DUSK, sun: [0.015, 0.012, 0.02], sky: [0.04, 0.038, 0.07], gnd: [0.014, 0.013, 0.02], envK: 0.09, fog: [0.05, 0.045, 0.075], fogD: 0.036, shaft: 0.5, night: 0.85, exp: 1.25, tint: [0.96, 0.97, 1.06], sat: 0.84, contrast: 0.3, bloom: 0.75 },
+  { h: 19.9, ...NIGHT },
+  { h: 24, ...NIGHT },
 ];
 
 const mix = (a: number, b: number, t: number) => a + (b - a) * t;
 const mix3 = (a: V3, b: V3, t: number): V3 => [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
+
+/** 主光方向：白天是太阳（东升西落，偏南），夜里是月亮（从北面照过来，人与屋舍多是逆光的剪影） */
+export function sunDirAt(hour: number): V3 {
+  let v: V3;
+  if (hour >= DAWN && hour < DUSK) {
+    const a = ((hour - DAWN) / (DUSK - DAWN)) * Math.PI;
+    v = [Math.cos(a) * 0.85, 0.22 + 0.62 * Math.sin(a), 0.42];
+  } else {
+    const a = ((((hour - DUSK) % 24) + 24) % 24 / (24 - DUSK + DAWN)) * Math.PI;
+    v = [Math.cos(a) * 0.7, 0.4 + 0.4 * Math.sin(a), -0.38];
+  }
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l];
+}
 
 export function envAt(hour: number): Env {
   hour = ((hour % 24) + 24) % 24;
@@ -86,11 +115,11 @@ export function envAt(hour: number): Env {
   let t = (hour - a.h) / (b.h - a.h);
   t = t * t * (3 - 2 * t);
   return {
-    sunDir: SUN_DIR,
-    sunCol: mix3(a.sun, b.sun, t), ambSky: mix3(a.sky, b.sky, t), ambGnd: mix3(a.gnd, b.gnd, t), skyRefl: mix3(a.refl, b.refl, t),
-    fog: [mix(a.fog[0], b.fog[0], t), mix(a.fog[1], b.fog[1], t), mix(a.fog[2], b.fog[2], t), mix(a.fog[3], b.fog[3], t)],
-    shadowK: mix(a.shadow, b.shadow, t), exposure: mix(a.exp, b.exp, t), bloom: 0.55 + mix(a.night, b.night, t) * 0.35,
-    sat: mix(a.sat, b.sat, t), tint: mix3(a.tint, b.tint, t), vignette: 0.32, night: mix(a.night, b.night, t),
+    sunDir: sunDirAt(hour),
+    sunCol: mix3(a.sun, b.sun, t), ambSky: mix3(a.sky, b.sky, t), ambGnd: mix3(a.gnd, b.gnd, t), envK: mix(a.envK, b.envK, t),
+    fogCol: mix3(a.fog, b.fog, t), fogDensity: mix(a.fogD, b.fogD, t), fogFalloff: 0.5, shaftK: mix(a.shaft, b.shaft, t),
+    exposure: mix(a.exp, b.exp, t), bloom: mix(a.bloom, b.bloom, t), sat: mix(a.sat, b.sat, t), contrast: mix(a.contrast, b.contrast, t),
+    tint: mix3(a.tint, b.tint, t), vignette: 0.42, night: mix(a.night, b.night, t),
   };
 }
 

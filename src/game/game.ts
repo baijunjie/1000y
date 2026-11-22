@@ -1,14 +1,16 @@
-import { loadAtlas } from '../engine/assets';
-import type { Atlas, Env, Renderer } from '../engine/renderer';
-import { SIN } from '../shared/consts';
+import type { Actors } from '../engine/actors';
+import type { Env, Renderer } from '../engine/renderer';
+import type { Statics } from '../engine/statics';
+import { actorDef } from '../models/registry';
+import type * as THREE from 'three';
 import { ARTS, ITEMS, KIND_NAME, MOBS, MoveDef, NPCS, QUESTS, WeaponKind } from './data';
 import { Entity, Mob, Npc, Sprite } from './entity';
 import { envAt, FX, Particles } from './fx';
 import { Player, PlayerSave } from './player';
-import { MapData, StaticObj, World } from './world';
+import { MapData, World } from './world';
 
 export interface Loot { id: number; x: number; z: number; items: [string, number][]; coins: number; t: number; }
-export interface GatherNode { x: number; z: number; item: string; obj: StaticObj; respawn: number; }
+export interface GatherNode { x: number; z: number; item: string; obj: { hidden: boolean; view: THREE.Object3D | null }; respawn: number; }
 interface Shot {
   kind: 'arrow' | 'wave';
   x: number; y: number; z: number; vx: number; vz: number;
@@ -40,6 +42,8 @@ export class Game {
   nodes: GatherNode[] = [];
   shots: Shot[] = [];
   texts: FloatText[] = [];
+  /** 击中瞬间的一闪（短促的点光，照亮周围） */
+  flashes: { x: number; y: number; z: number; t: number; k: number }[] = [];
   parts = new Particles();
   hour = 9.5;
   env: Env = envAt(9.5);
@@ -65,7 +69,6 @@ export class Game {
   private lootSeq = 1;
   private marker = { x: 0, z: 0, t: 9 };
   private dash = { t: 0, dur: 0, vx: 0, vz: 0 };
-  private playerAtlases: Partial<Record<WeaponKind, Atlas>> = {};
 
   // UI 回调
   onLog: (msg: string, cls?: string) => void = () => {};
@@ -75,65 +78,41 @@ export class Game {
   onDeath: () => void = () => {};
   onSfx: (name: string, vol?: number) => void = () => {};
 
-  constructor(public r: Renderer, public world: World, public atlases: Record<string, Atlas>, public map: MapData) {}
+  constructor(public r: Renderer, public world: World, public statics: Statics, public actors: Actors, public map: MapData) {}
 
   // ================================================================ 初始化
   async init() {
     const save = this.readSave();
     if (save) { this.p.load(save); this.hour = save.hour; }
-    const kind = this.p.weaponKind;
-    const atlas = await loadAtlas(this.r, 'player_' + kind);
-    this.playerAtlases[kind] = atlas;
     const sx = save?.x ?? this.map.spawn.x, sz = save?.z ?? this.map.spawn.z;
     const [fx, fz] = this.world.nearestFree(sx, sz);
-    this.pe = new Entity('player', new Sprite(atlas), fx, fz);
+    this.pe = new Entity('player', new Sprite(actorDef('player_' + this.p.weaponKind)), fx, fz);
     this.pe.name = '少侠'; this.pe.radius = 0.38;
-    this.r.cam.x = fx; this.r.cam.y = fz * SIN;
+    this.r.focus.set(fx, 0.9, fz);
 
     this.spawnMobs();
-    const npcAtlas = this.atlases['npcs'];
-    if (npcAtlas) {
-      for (const n of this.map.npcs) {
-        const def = NPCS[n.id];
-        if (!def) continue;
-        this.npcs.push(new Npc(def, new Sprite(npcAtlas, n.id + ':'), n.x, n.z, n.dir));
-      }
+    for (const n of this.map.npcs) {
+      const def = NPCS[n.id];
+      if (!def) continue;
+      this.npcs.push(new Npc(def, new Sprite(actorDef('npc:' + n.id)), n.x, n.z, n.dir));
     }
-    const nat = this.atlases['env_nature'];
     for (const g of this.map.gather) {
-      const frame = nat?.meta.frames[g.k];
-      if (!nat || !frame) continue;
-      const obj = this.world.addStatic({ atlas: nat, frame, x: g.x, z: g.z, s: 1.15, flip: false, emissive: false, key: g.k });
-      this.nodes.push({ x: g.x, z: g.z, item: g.item, obj, respawn: 0 });
+      const view = this.statics.single(g.k, g.x, g.z, 1.15);
+      this.nodes.push({ x: g.x, z: g.z, item: g.item, obj: { hidden: false, view }, respawn: 0 });
     }
     this.env = envAt(this.hour);
     this.checkZone(true);
   }
 
-  private spawned = new Set<number>();
-  /** 为图集已就绪的刷怪点生成怪物；野外怪物的图集在进入游戏后才陆续加载完，可重复调用 */
   spawnMobs() {
-    this.map.spawns.forEach((s, i) => {
-      if (this.spawned.has(i)) return;
+    for (const s of this.map.spawns) {
       const def = MOBS[s.mob];
-      const atlas = def && this.atlases[def.atlas];
-      if (!def || !atlas) return;
-      this.spawned.add(i);
+      if (!def) continue;
       for (let k = 0; k < s.n; k++) {
         const [x, z] = this.randomNear(s.x, s.z, s.r);
-        this.mobs.push(new Mob(def, new Sprite(atlas), { x: s.x, z: s.z, r: s.r }, x, z));
+        this.mobs.push(new Mob(def, new Sprite(actorDef(def.atlas)), { x: s.x, z: s.z, r: s.r }, x, z));
       }
-    });
-  }
-
-  private async ensurePlayerAtlas(kind: WeaponKind) {
-    if (this.playerAtlases[kind]) return this.playerAtlases[kind]!;
-    try {
-      const a = await loadAtlas(this.r, 'player_' + kind);
-      this.playerAtlases[kind] = a;
-      if (this.p.weaponKind === kind) this.pe.spr.setAtlas(a);
-      return a;
-    } catch { return null; }
+    }
   }
 
   private randomNear(x: number, z: number, r: number): [number, number] {
@@ -161,7 +140,7 @@ export class Game {
     let best: Pick = null, bd = Infinity;
     const test = (x: number, y: number, z: number, rad: number, mk: () => Pick, bias = 0) => {
       const [px, py] = r.worldToScreen(x, y, z);
-      const k = (r.cam.ppm * r.canvas.clientWidth) / r.W;
+      const k = r.pxPerMeter(x, y, z);
       const d = Math.hypot((sx - px) / (rad * k + 10), (sy - py) / (rad * k * 1.5 + 12));
       if (d < 1 && d + bias < bd) { bd = d + bias; best = mk(); }
     };
@@ -260,12 +239,10 @@ export class Game {
       if (t.t > 1.25) this.texts.splice(i, 1);
     }
     // 镜头
-    const cam = this.r.cam;
-    const tx = this.pe.x, ty = this.pe.z * SIN - this.pe.y * 0.7 - 0.55;
+    const f = this.r.focus;
     const k = 1 - Math.exp(-dt * 7);
-    cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k;
-    const base = this.r.H / 11.4;
-    cam.ppm += (base * this.zoom - cam.ppm) * (1 - Math.exp(-dt * 10));
+    f.x += (this.pe.x - f.x) * k; f.y += (this.pe.y + 0.9 - f.y) * k; f.z += (this.pe.z - f.z) * k;
+    this.r.zoom += (this.zoom - this.r.zoom) * (1 - Math.exp(-dt * 10));
     if (this.shake > 0) this.shake = Math.max(0, this.shake - dt * 3.2);
     this.checkZone();
     this.saveT += dt;
@@ -308,7 +285,7 @@ export class Game {
       this.dash.t += dt;
       const nx = e.x + this.dash.vx * dt, nz = e.z + this.dash.vz * dt;
       if (!w.blocked(nx, nz)) { e.x = nx; e.z = nz; e.y = w.elevation(nx, nz); }
-      this.parts.spawn({ x: e.x, y: 1, z: e.z, max: 0.25, size: 1.2, size2: 0.3, cell: FX.GLOW, r: 0.5, g: 0.8, b: 1.3, a: 0.5 });
+      this.dust(e.x, e.y, e.z, 1, 0.9);
       if (this.dash.t >= this.dash.dur) { this.state = 'normal'; e.spr.play('idle'); }
       return;
     }
@@ -325,10 +302,6 @@ export class Game {
         p.mpMax += 0.06 + eff * 0.002;
         if (g.up) this.artUp(id, g.lv);
         this.onChange('stats');
-      }
-      if (Math.random() < dt * 9) {
-        const a = Math.random() * Math.PI * 2, d = rand(0.3, 0.9);
-        this.parts.spawn({ x: e.x + Math.cos(a) * d, y: e.y + 0.1, z: e.z + Math.sin(a) * d * 0.7, vy: rand(0.5, 1.1), max: rand(0.9, 1.5), size: 0.12, size2: 0.03, cell: FX.SPARK, r: 0.6, g: 0.95, b: 1.5, a: 0.9 });
       }
       return;
     }
@@ -402,7 +375,7 @@ export class Game {
       if (this.stepT > 0.3) {
         this.stepT = 0;
         this.onSfx('step', 0.25);
-        this.parts.spawn({ x: e.x, y: e.y + 0.08, z: e.z, vy: 0.25, max: 0.6, size: 0.25, size2: 0.75, cell: FX.SMOKE, r: 0.5, g: 0.45, b: 0.36, a: 0.3, add: 0, lit: true });
+        this.dust(e.x, e.y, e.z, 1, 0.3, 0.5);
         const id = p.use.step;
         const g = p.gain(id, 0.011, p.lv(id) + 4);
         if (g.up) this.artUp(id, g.lv);
@@ -445,18 +418,32 @@ export class Game {
     this.playerHit(m, 1);
   }
 
-  private slashFx(e: Entity, kind: WeaponKind, scale = 1, col: [number, number, number] = [0.9, 1.0, 1.25]) {
-    const a = e.faceAngle, fx = Math.sin(a), fz = Math.cos(a);
-    if (kind === 'fist') {
-      this.parts.spawn({ x: e.x + fx * 1.0, y: e.y + 1.15, z: e.z + fz * 1.0, max: 0.16, size: 0.3, size2: 1.0 * scale, cell: FX.RING, r: 1.3, g: 1.1, b: 0.8, a: 0.8 });
-      return;
+  /** 扬尘：受环境光照亮的灰土色烟团 */
+  private dust(x: number, y: number, z: number, n = 3, spread = 0.5, up = 0.5) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, sp = rand(0.3, 1.2) * spread;
+      this.parts.spawn({
+        x: x + Math.cos(a) * 0.15, y: y + 0.08, z: z + Math.sin(a) * 0.15, vx: Math.cos(a) * sp, vy: rand(0.15, 0.6) * up, vz: Math.sin(a) * sp,
+        max: rand(0.5, 1.0), size: rand(0.25, 0.4), size2: rand(0.8, 1.3), cell: FX.SMOKE, r: 0.5, g: 0.45, b: 0.38, a: 0.22, add: 0, lit: true, drag: 2.5,
+      });
     }
-    const reach = kind === 'spear' ? 1.9 : 1.25;
-    this.parts.spawn({
-      x: e.x + fx * reach * 0.62, y: e.y + (kind === 'spear' ? 1.05 : 1.0), z: e.z + fz * reach * 0.62, max: 0.2,
-      size: (kind === 'spear' ? 1.6 : 2.5) * scale, size2: (kind === 'spear' ? 2.2 : 3.1) * scale, cell: FX.SLASH,
-      r: col[0], g: col[1], b: col[2], a: 0.95, flat: true, rot: a + Math.PI + (this.atkAlt ? 0.35 : -0.35), vr: this.atkAlt ? -3 : 3,
-    });
+  }
+
+  /** 金铁交击迸出的火星 */
+  private sparks(x: number, y: number, z: number, n: number, dx = 0, dz = 0) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, sp = rand(1.5, 5.5);
+      this.parts.spawn({
+        x, y, z, vx: Math.cos(a) * sp * 0.6 + dx * rand(1, 4), vy: rand(0.5, 4), vz: Math.sin(a) * sp * 0.6 + dz * rand(1, 4),
+        max: rand(0.18, 0.42), size: rand(0.05, 0.09), size2: 0.01, cell: FX.SPARK, r: 3.2, g: 1.9, b: 0.7, a: 1, grav: 14, drag: 1.5,
+      });
+    }
+  }
+
+  /** 出手时脚下带起的一点尘土（刀光本身由渲染层按兵器的真实轨迹画出） */
+  private slashFx(e: Entity, _kind: WeaponKind, scale = 1) {
+    const a = e.faceAngle;
+    this.dust(e.x + Math.sin(a) * 0.5, e.y, e.z + Math.cos(a) * 0.5, scale > 1 ? 4 : 1, 0.6 * scale, 0.4);
   }
 
   private playerHit(m: Mob, mult: number, o: { stun?: number; knock?: number; sure?: boolean } = {}): boolean {
@@ -501,12 +488,13 @@ export class Game {
     this.float(m.x + rand(-0.2, 0.2), m.y + m.height * 0.9, m.z, String(dmg) + (crit ? '!' : ''), crit ? '#ffd24a' : '#ffffff', crit ? 26 : 19);
     this.onSfx(crit ? 'crit' : 'hit', crit ? 0.8 : 0.55);
     if (crit) this.shake = Math.max(this.shake, 0.35);
-    const hx = m.x, hy = m.y + m.height * 0.55, hz = m.z;
-    this.parts.spawn({ x: hx, y: hy, z: hz + 0.1, max: 0.14, size: 0.5, size2: crit ? 2.0 : 1.3, cell: FX.GLOW, r: 1.6, g: 1.3, b: 0.8, a: 0.9 });
-    for (let i = 0; i < (crit ? 12 : 6); i++) {
-      const a = Math.random() * Math.PI * 2, s = rand(2, 6);
-      this.parts.spawn({ x: hx, y: hy, z: hz, vx: Math.cos(a) * s, vy: rand(1, 4.5), vz: Math.sin(a) * s * 0.7, max: rand(0.25, 0.5), size: 0.16, size2: 0.02, cell: FX.SPARK, r: 2, g: 1.5, b: 0.7, a: 1, grav: 12, drag: 2 });
-    }
+    const hd = Math.max(0.01, from.dist(m)), ux = (m.x - from.x) / hd, uz = (m.z - from.z) / hd;
+    const hx = m.x - ux * m.radius * 0.6, hy = m.y + m.height * 0.55, hz = m.z - uz * m.radius * 0.6;
+    const blade = from !== this.pe || this.p.weaponKind !== 'fist';
+    // 兵刃入肉 / 击木：几点火星加一小团尘，不发光球
+    if (blade) this.sparks(hx, hy, hz, crit ? 9 : 4, ux, uz);
+    this.dust(hx, hy - 0.2, hz, crit ? 3 : 1, 0.7, 1.2);
+    this.flashes.push({ x: hx, y: hy + 0.1, z: hz, t: 0, k: crit ? 1.5 : 0.9 });
     if (m.def.still) {
       m.spr.play('hit', true);
       if (m.hp < m.hpMax * 0.5) m.hp = m.hpMax;
@@ -550,11 +538,6 @@ export class Game {
     this.onSfx('levelup', 0.7);
     const e = this.pe;
     this.float(e.x, e.y + 2.3, e.z, `${a.name} ${Math.floor(lv)}`, '#8fe3ff', 20);
-    this.parts.spawn({ x: e.x, y: e.y + 0.05, z: e.z, max: 0.7, size: 0.6, size2: 3.6, cell: FX.RING, r: 0.6, g: 1.2, b: 1.6, a: 0.9, flat: true });
-    for (let i = 0; i < 14; i++) {
-      const an = Math.random() * Math.PI * 2;
-      this.parts.spawn({ x: e.x + Math.cos(an) * 0.6, y: e.y + 0.1, z: e.z + Math.sin(an) * 0.45, vy: rand(1.2, 2.6), max: rand(0.6, 1.1), size: 0.16, size2: 0.02, cell: FX.SPARK, r: 0.7, g: 1.3, b: 1.8, a: 1 });
-    }
     if (a.move && Math.floor(lv) === a.move.unlock) this.onLog(`领悟绝招「${a.move.name}」！按空格或鼠标右键施展。`, 'good');
     this.onChange('arts');
   }
@@ -595,12 +578,9 @@ export class Game {
         kind: 'wave', x: e.x + fx * 0.8, y: e.y + 1.0, z: e.z + fz * 0.8, vx: fx * 17, vz: fz * 17, life: 0.6, from: e, target: null,
         hit: new Set(), hostile: false, onHit: (m) => this.playerHit(m as Mob, mv.mult, { knock: 4, sure: true }),
       });
-      this.slashFx(e, 'sword', 1.3, [0.6, 1.1, 1.6]);
+      this.slashFx(e, 'sword', 1.3);
     } else if (mv.kind === 'spin') {
-      for (let i = 0; i < 3; i++) {
-        this.parts.spawn({ x: e.x, y: e.y + 0.9 + i * 0.15, z: e.z, max: 0.32, size: 2.4, size2: 7.2, cell: FX.SLASH, r: 1.3, g: 1.0, b: 0.6, a: 0.9, flat: true, rot: ang + i * 2.1, vr: 16 });
-      }
-      this.parts.spawn({ x: e.x, y: e.y + 0.06, z: e.z, max: 0.4, size: 1, size2: 7, cell: FX.RING, r: 1.4, g: 1.0, b: 0.5, a: 0.8, flat: true });
+      for (let i = 0; i < 10; i++) { const an = (i / 10) * Math.PI * 2; this.dust(e.x + Math.cos(an) * 1.4, e.y, e.z + Math.sin(an) * 1.4, 1, 1.6, 0.5); }
       for (const m of this.mobs) if (!m.dead && e.dist(m) - m.radius < 3.3) this.playerHit(m, mv.mult, { knock: 5, sure: true });
     } else if (mv.kind === 'pierce') {
       let len = 0;
@@ -614,10 +594,9 @@ export class Game {
       this.dash = { t: 0, dur: 0.2, vx: (fx * len) / 0.2, vz: (fz * len) / 0.2 };
       e.spr.play('atk1', true, 1.6);
       e.atkT = -1;
-      this.parts.spawn({ x: e.x + fx * (len / 2 + 1.2), y: e.y + 1.0, z: e.z + fz * (len / 2 + 1.2), max: 0.3, size: len + 3, size2: len + 4, cell: FX.SLASH, r: 0.8, g: 1.1, b: 1.6, a: 0.8, flat: true, rot: ang + Math.PI });
+      for (let d = 0; d < len; d += 0.6) this.dust(e.x + fx * d, e.y, e.z + fz * d, 1, 0.5, 0.6);
     } else if (mv.kind === 'burst' && t) {
-      this.parts.spawn({ x: t.x, y: t.y + 0.06, z: t.z, max: 0.45, size: 0.6, size2: 5, cell: FX.RING, r: 1.6, g: 1.2, b: 0.6, a: 0.9, flat: true });
-      this.parts.spawn({ x: t.x, y: t.y + t.height * 0.5, z: t.z + 0.1, max: 0.25, size: 1, size2: 4, cell: FX.GLOW, r: 2, g: 1.5, b: 0.8, a: 1 });
+      this.dust(t.x, t.y, t.z, 8, 1.8, 0.9);
       this.playerHit(t, mv.mult, { stun: 1.8, knock: 7, sure: true });
       this.shake = 0.7;
     } else if (mv.kind === 'volley' && t) {
@@ -656,7 +635,7 @@ export class Game {
           if (m.dead || s.hit.has(m.id)) continue;
           if (Math.hypot(m.x - s.x, m.z - s.z) < 1.3 + m.radius) { s.hit.add(m.id); s.onHit(m); }
         }
-        if (Math.random() < dt * 60) this.parts.spawn({ x: s.x + rand(-0.5, 0.5), y: s.y + rand(-0.3, 0.3), z: s.z + rand(-0.4, 0.4), max: 0.3, size: 0.25, size2: 0.02, cell: FX.SPARK, r: 0.6, g: 1.1, b: 1.7, a: 1 });
+        if (Math.random() < dt * 40) this.dust(s.x, 0, s.z, 1, 0.6, 0.5);
       }
       if (dead) this.shots.splice(i, 1);
     }
@@ -692,7 +671,6 @@ export class Game {
     if (m.kx || m.kz) this.applyKnock(m, dt);
     if (m.stun > 0) {
       m.stun -= dt;
-      if (Math.random() < dt * 10) this.parts.spawn({ x: m.x + rand(-0.3, 0.3), y: m.y + m.height + 0.1, z: m.z, vy: 0.4, max: 0.5, size: 0.14, size2: 0.02, cell: FX.SPARK, r: 1.6, g: 1.4, b: 0.5, a: 1 });
       return;
     }
     const pd = pe.dist(m);
@@ -854,11 +832,11 @@ export class Game {
     p.coins -= lost;
     p.hp = p.hpMax * 0.6; p.mp = p.mpMax * 0.5; p.sp = p.spMax;
     const [x, z] = this.world.nearestFree(this.map.spawn.x, this.map.spawn.z);
-    e.x = x; e.z = z; e.y = 0; e.dir = 0; e.stun = 0; e.kx = e.kz = 0;
+    e.x = x; e.z = z; e.y = 0; e.setDir(0); e.stun = 0; e.kx = e.kz = 0;
     this.state = 'normal';
     e.spr.play('idle', true);
     for (const m of this.mobs) if (m.target === e) { m.target = null; if (!m.dead) m.state = 'return'; m.path = null; }
-    this.r.cam.x = x; this.r.cam.y = z * SIN;
+    this.r.focus.set(x, 0.9, z);
     this.onLog(`你在落霞村醒来${lost ? `，丢了 ${lost} 文钱` : ''}。`, 'sys');
     this.onChange('all');
     this.save();
@@ -936,7 +914,11 @@ export class Game {
   }
 
   private updateWorldBits(dt: number) {
-    for (const g of this.nodes) if (g.obj.hidden) { g.respawn -= dt; if (g.respawn <= 0) g.obj.hidden = false; }
+    for (const g of this.nodes) {
+      if (g.obj.hidden) { g.respawn -= dt; if (g.respawn <= 0) g.obj.hidden = false; }
+      if (g.obj.view) g.obj.view.visible = !g.obj.hidden;
+    }
+    for (let i = this.flashes.length - 1; i >= 0; i--) { this.flashes[i].t += dt; if (this.flashes[i].t > 0.12) this.flashes.splice(i, 1); }
     for (let i = this.loots.length - 1; i >= 0; i--) { this.loots[i].t += dt; if (this.loots[i].t > 150) this.loots.splice(i, 1); }
   }
 
@@ -967,7 +949,6 @@ export class Game {
       if (h.parts) for (const k of ['head', 'arm', 'leg'] as const) p.parts[k] = Math.min(100, p.parts[k] + h.parts);
       this.onLog(`使用了${it.name}。`, 'sys');
       const e = this.pe;
-      for (let i = 0; i < 8; i++) this.parts.spawn({ x: e.x + rand(-0.4, 0.4), y: e.y + rand(0.2, 1.2), z: e.z + rand(-0.2, 0.2), vy: rand(0.8, 1.6), max: 0.8, size: 0.14, size2: 0.02, cell: FX.SPARK, r: h.mp ? 0.5 : 0.6, g: h.mp ? 0.8 : 1.5, b: h.mp ? 1.7 : 0.7, a: 1 });
       this.onSfx('drink', 0.5);
     } else if (it.type === 'book' && it.teaches) {
       const a = ARTS[it.teaches];
@@ -993,8 +974,7 @@ export class Game {
   }
   private onWeaponChanged() {
     const kind = this.p.weaponKind;
-    const a = this.playerAtlases[kind];
-    if (a) this.pe.spr.setAtlas(a); else this.ensurePlayerAtlas(kind);
+    this.pe.spr.setDef(actorDef('player_' + kind));
     this.pe.atkT = -1;
     this.pe.spr.play('idle', true);
   }
@@ -1064,10 +1044,10 @@ export class Game {
       }
     }
     // 萤火
-    if (env.night > 0.55 && Math.random() < dt * 14 * env.night) {
+    if (env.night > 0.55 && Math.random() < dt * 5 * env.night) {
       const x = rand(x0, x1), z = rand(z0, z1);
       if (!this.world.blocked(x, z) || Math.random() < 0.3) {
-        this.parts.spawn({ x, y: rand(0.4, 2.0), z, vx: rand(-0.3, 0.3), vy: rand(-0.1, 0.15), vz: rand(-0.2, 0.2), max: rand(3, 6), size: 0.22, size2: 0.22, cell: FX.SPARK, r: 1.0, g: 1.5, b: 0.45, a: 0.95, sway: 0.8, rot: rand(0, 6) });
+        this.parts.spawn({ x, y: rand(0.4, 2.0), z, vx: rand(-0.3, 0.3), vy: rand(-0.1, 0.15), vz: rand(-0.2, 0.2), max: rand(3, 6), size: 0.1, size2: 0.1, cell: FX.SPARK, r: 0.9, g: 1.3, b: 0.4, a: 0.9, sway: 0.8, rot: rand(0, 6) });
       }
     }
     // 篝火
@@ -1075,7 +1055,7 @@ export class Game {
       if (f.x < x0 - 2 || f.x > x1 + 2 || f.z < z0 - 2 || f.z > z1 + 4) continue;
       const k = f.k;
       for (let i = 0; i < 2; i++) {
-        this.parts.spawn({ x: f.x + rand(-0.22, 0.22) * k, y: f.y + rand(0, 0.15), z: f.z + rand(-0.12, 0.12) * k + 0.1, vx: rand(-0.15, 0.15), vy: rand(1.1, 2.0) * k, max: rand(0.35, 0.7), size: rand(0.55, 0.8) * k, size2: 0.12 * k, cell: FX.GLOW, r: 2.4, g: 1.0, b: 0.25, a: 0.6 });
+        this.parts.spawn({ x: f.x + rand(-0.22, 0.22) * k, y: f.y + rand(0, 0.15), z: f.z + rand(-0.12, 0.12) * k + 0.1, vx: rand(-0.15, 0.15), vy: rand(1.1, 2.0) * k, max: rand(0.3, 0.6), size: rand(0.3, 0.46) * k, size2: 0.08 * k, cell: FX.GLOW, r: 2.0, g: 0.75, b: 0.16, a: 0.55 });
       }
       if (Math.random() < dt * 20) this.parts.spawn({ x: f.x + rand(-0.2, 0.2) * k, y: f.y + 0.4 * k, z: f.z + 0.1, vx: rand(-0.5, 0.5), vy: rand(1.5, 3.2), vz: rand(-0.3, 0.3), max: rand(0.8, 1.6), size: 0.09, size2: 0.02, cell: FX.SPARK, r: 2.4, g: 1.2, b: 0.4, a: 1, sway: 0.6 });
       if (f.big && Math.random() < dt * 5) this.parts.spawn({ x: f.x + rand(-0.15, 0.15), y: f.y + 1.2, z: f.z, vx: rand(0.1, 0.4), vy: rand(0.7, 1.1), max: rand(2, 3.2), size: 0.5, size2: 1.8, cell: FX.SMOKE, r: 0.35, g: 0.33, b: 0.32, a: 0.22, add: 0, lit: true });
@@ -1084,81 +1064,66 @@ export class Game {
 
   // ================================================================ 提交渲染
   submit() {
-    const r = this.r, env = this.env, t = this.time;
+    const r = this.r, env = this.env, t = this.time, dt = this.frameDt;
     r.begin();
-    if (this.shake > 0) {
-      const s = this.shake * this.shake * 0.16;
-      r.cam.x += (Math.random() - 0.5) * s; r.cam.y += (Math.random() - 0.5) * s;
-    }
-    this.world.submit(r, env.night, t, this.pe, this.frameDt);
-    const [x0, z0, x1, z1] = r.viewBounds(4);
-    const vis = (e: { x: number; z: number }) => e.x > x0 && e.x < x1 && e.z > z0 && e.z < z1 + 4;
+    this.actors.begin();
+    r.shake = this.shake;
+    // 镜头与主角之间的遮挡物（树冠、屋檐）挖空
+    r.uniforms.uHoleB.value.set(this.pe.x, this.pe.y + 1.0, this.pe.z);
+    this.world.submitLights(r, env.night, t);
+    const [x0, z0, x1, z1] = r.viewBounds(5);
+    const vis = (e: { x: number; z: number }) => e.x > x0 && e.x < x1 && e.z > z0 && e.z < z1;
     const hoverE = this.hover && (this.hover.type === 'mob' || this.hover.type === 'npc') ? this.hover.e : null;
     const draw = (e: Entity) => {
       if (!vis(e) || e.alpha <= 0.01) return;
-      const f = e.spr.frame(e.dir);
-      if (!f) return;
-      r.sprite(e.spr.atlas, f, e.x, e.y, e.z, e.scale, {
-        tint: e.tint, alpha: e.alpha, flash: Math.min(1, e.flash * 0.75 + (e === hoverE ? 0.13 : 0)), shadow: 'dynamic', sortBias: 0.02,
-      });
+      this.actors.draw(e, dt);
     };
     for (const m of this.mobs) draw(m);
     for (const n of this.npcs) draw(n);
     draw(this.pe);
+    this.actors.end();
 
-    // 目标圈、点击标记
+    // 目标圈、点击标记：贴地的细线圈，不发光
     if (this.target && !this.target.dead) {
       const m = this.target, d = m.radius * 2.6 + 0.5;
-      r.fxFlat(m.x, m.y + 0.04, m.z, d, d, t * 0.8, FX.RING, 1.5, 0.3, 0.2, 0.75);
+      r.fxFlat(m.x, m.y + 0.05, m.z, d, d, t * 0.8, FX.RING, 0.9, 0.16, 0.1, 0.8);
     }
     if (hoverE && hoverE !== this.target) {
       const d = hoverE.radius * 2.6 + 0.5, npc = hoverE.kind === 'npc';
-      r.fxFlat(hoverE.x, hoverE.y + 0.04, hoverE.z, d, d, t * 0.8, FX.RING, npc ? 1.2 : 1.3, npc ? 1.0 : 0.6, npc ? 0.4 : 0.4, 0.45);
+      r.fxFlat(hoverE.x, hoverE.y + 0.05, hoverE.z, d, d, t * 0.8, FX.RING, npc ? 0.8 : 0.8, npc ? 0.65 : 0.35, npc ? 0.25 : 0.2, 0.5);
     }
     if (this.marker.t < 0.5) {
       const k = this.marker.t / 0.5;
-      r.fxFlat(this.marker.x, this.world.elevation(this.marker.x, this.marker.z) + 0.04, this.marker.z, 0.5 + k * 0.9, 0.5 + k * 0.9, 0, FX.RING, 0.9, 1.2, 0.7, (1 - k) * 0.8);
+      r.fxFlat(this.marker.x, this.world.elevation(this.marker.x, this.marker.z) + 0.05, this.marker.z, 0.4 + k * 0.7, 0.4 + k * 0.7, 0, FX.RING, 0.7, 0.7, 0.6, (1 - k) * 0.7);
     }
-    // 掉落
+    // 掉落：一点金属反光似的闪烁，方便在暗处找到
     for (const l of this.loots) {
       if (!vis(l)) continue;
-      const pulse = 0.75 + 0.25 * Math.sin(t * 4 + l.id);
+      const pulse = 0.6 + 0.4 * Math.sin(t * 4 + l.id);
       const rare = l.items.some(([id]) => ITEMS[id].type === 'book' || ITEMS[id].price >= 300);
-      const c: [number, number, number] = rare ? [1.6, 0.9, 1.8] : [1.8, 1.4, 0.5];
-      r.fxBillboard(l.x, 0.28, l.z, 0.75, FX.GLOW, c[0], c[1], c[2], 0.75 * pulse);
-      r.fxBillboard(l.x, 0.26, l.z, 0.2, FX.DOT, 0.85, 0.65, 0.3, 1, 0);
-      r.fxBillboard(l.x, 0.3 + 0.08 * Math.sin(t * 3 + l.id), l.z, 0.5, FX.SPARK, c[0], c[1], c[2], pulse, 1, t * 2);
-      r.light(l.x, 0.4, l.z, 2.2, c, 0.5 * pulse);
-    }
-    // 采集点微光
-    for (const g of this.nodes) {
-      if (g.obj.hidden || !vis(g)) continue;
-      r.fxBillboard(g.x, 0.45, g.z, 0.5, FX.SPARK, 0.6, 1.4, 0.6, 0.45 + 0.35 * Math.sin(t * 3 + g.x), 1, t);
+      const c: [number, number, number] = rare ? [1.5, 1.2, 1.7] : [1.7, 1.4, 0.8];
+      r.fxBillboard(l.x, 0.14, l.z, 0.22, FX.DOT, 0.5, 0.4, 0.22, 1, 0);
+      r.fxBillboard(l.x, 0.22, l.z, 0.34 * pulse, FX.SPARK, c[0], c[1], c[2], pulse, 1, t * 2);
     }
     // 弹道
     for (const s of this.shots) {
+      const sp = Math.hypot(s.vx, s.vz), dx = s.vx / sp, dz = s.vz / sp;
       if (s.kind === 'arrow') {
-        const sp = Math.hypot(s.vx, s.vz), dx = s.vx / sp, dz = s.vz / sp, nx = -dz * 0.035, nz = dx * 0.035, L = 0.45;
+        const nx = -dz * 0.02, nz = dx * 0.02, L = 0.45;
         r.fxQuad([
-          s.x - dx * L + nx, s.y, s.z - dz * L + nz, s.x + dx * L + nx, s.y, s.z + dz * L + nz,
-          s.x - dx * L - nx, s.y + 0.05, s.z - dz * L - nz, s.x + dx * L - nx, s.y + 0.05, s.z + dz * L - nz,
-        ], FX.DOT, 0.75, 0.6, 0.4, 1, 0);
-        r.fxBillboard(s.x + dx * L, s.y, s.z + dz * L, 0.2, FX.SPARK, 1.4, 1.3, 1.1, 0.8);
+          s.x - dx * L + nx, s.y + 0.02, s.z - dz * L + nz, s.x + dx * L + nx, s.y + 0.02, s.z + dz * L + nz,
+          s.x - dx * L - nx, s.y - 0.02, s.z - dz * L - nz, s.x + dx * L - nx, s.y - 0.02, s.z + dz * L - nz,
+        ], FX.DOT, 0.5, 0.4, 0.28, 1, 0);
       } else {
+        // 剑气：一道贴着地面掠过的淡淡白弧，不带光晕
         const a = Math.atan2(s.vx, s.vz);
-        r.fxFlat(s.x, s.y, s.z, 3.2, 2.0, a + Math.PI, FX.SLASH, 0.6, 1.2, 1.9, 1);
-        r.fxFlat(s.x, s.y + 0.05, s.z, 2.4, 1.5, a + Math.PI, FX.SLASH, 1.5, 1.6, 1.8, 0.9);
-        r.light(s.x, s.y, s.z, 5, [0.4, 0.8, 1.4], 1.2);
+        r.fxFlat(s.x, s.y, s.z, 2.6, 1.5, a + Math.PI, FX.SLASH, 1.3, 1.4, 1.5, 0.7);
       }
     }
-    // 打坐光环
-    if (this.state === 'sit') {
-      const e = this.pe;
-      r.fxFlat(e.x, e.y + 0.05, e.z, 2.2, 2.2, t * 0.6, FX.RING, 0.4, 0.9, 1.5, 0.5 + 0.2 * Math.sin(t * 2));
-      r.light(e.x, e.y + 0.8, e.z, 4, [0.3, 0.6, 1.0], 0.7);
-    }
-    // 夜间玩家身周的微光，保证可读性
-    if (env.night > 0.3) r.light(this.pe.x, this.pe.y + 1.6, this.pe.z + 0.6, 5.5, [0.5, 0.56, 0.75], env.night * 0.7);
+    // 击中的一闪
+    this.flashes.forEach((f, i) => r.light('hit' + i, f.x, f.y, f.z, 4.5, [1.5, 1.35, 1.1], f.k * (1 - f.t / 0.12)));
+    // 夜里主角身周一点微弱的补光，保证在暗处也认得出人
+    if (env.night > 0.2) r.light('self', this.pe.x, this.pe.y + 2.6, this.pe.z + 1.6, 8, [0.66, 0.66, 0.74], env.night * 0.85);
     this.parts.draw(r, env);
   }
 }

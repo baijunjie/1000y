@@ -25,7 +25,7 @@ try {
   page.on('pageerror', (e) => console.log('[pageerror]', e.message));
   const q = new URLSearchParams({ nosave: '1' });
   if (!opt.title) q.set('autostart', '1');
-  for (const k of ['x', 'z', 'hour', 'zoom']) if (opt[k]) q.set(k, opt[k]);
+  for (const k of ['x', 'z', 'hour', 'zoom', 'msaa', 'scale', 'sl', 'pl']) if (opt[k]) q.set(k, opt[k]);
   await page.goto(`${base}?${q}`);
   await page.waitForFunction('window.__ready === true || !!window.__error', null, { timeout: 120000 });
   const err = await page.evaluate('window.__error');

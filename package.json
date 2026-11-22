@@ -2,7 +2,7 @@
   "name": "qiyun",
   "private": true,
   "version": "0.1.0",
-  "description": "栖云录 — 原创武侠 2D 俯视角单机 demo（3D 预渲染贴图 + 实时 2D 光照）",
+  "description": "栖云录 — 原创武侠俯视角单机 demo（实时 3D：动态阴影、体积雾、PBR 材质）",
   "author": "Junjie Bai <bjj19851010@gmail.com>",
   "type": "module",
   "scripts": {
@@ -10,16 +10,19 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "bake": "node tools/bake/bake.mjs",
+    "tex": "node tools/tex/fetch.mjs",
     "map": "node tools/map/build-map.mjs",
+    "check-map": "node tools/map/check-map.mjs",
     "shot": "node tools/shot.mjs"
+  },
+  "dependencies": {
+    "three": "^0.187.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/three": "^0.187.0",
     "playwright-core": "^1.65.1",
     "sharp": "^0.35.5",
-    "three": "^0.187.0",
     "typescript": "^5.9.0",
     "vite": "^8.3.8"
   }

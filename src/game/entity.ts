@@ -1,25 +1,26 @@
-import type { Atlas } from '../engine/renderer';
-import type { AnimMeta, FrameMeta } from '../shared/consts';
+import type { ActorDef } from '../models/registry';
+import type { AnimMeta } from '../shared/consts';
 import type { MobDef, NpcDef } from './data';
 import type { World } from './world';
 
-/** 角色动画精灵：帧 key 为 `${prefix}${anim}_${dir}_${frame}` */
+/** 角色的动画状态：只记「在播哪段、播到哪」，姿势由渲染层按时间实时求值 */
 export class Sprite {
   anim = 'idle';
   t = 0;
   speed = 1;
   done = false;
-  private cache = new Map<string, FrameMeta[][]>();
-  constructor(public atlas: Atlas, public prefix = '') {}
+  /** 每次切换或重播动画加一，渲染层据此做姿势过渡 */
+  seq = 0;
+  constructor(public def: ActorDef) {}
 
-  setAtlas(a: Atlas) { if (a !== this.atlas) { this.atlas = a; this.cache.clear(); } }
-  meta(anim = this.anim): AnimMeta | undefined { return this.atlas.meta.anims?.[anim]; }
+  setDef(d: ActorDef) { if (d !== this.def) { this.def = d; this.seq++; } }
+  meta(anim = this.anim): AnimMeta | undefined { return this.def.meta[anim]; }
   has(anim: string) { return !!this.meta(anim); }
   duration(anim = this.anim): number { const m = this.meta(anim); return m ? m.n / m.fps : 0; }
 
   play(anim: string, restart = false, speed = 1) {
     if (!this.has(anim)) return;
-    if (anim !== this.anim || restart) { this.anim = anim; this.t = 0; this.done = false; }
+    if (anim !== this.anim || restart) { this.anim = anim; this.t = 0; this.done = false; this.seq++; }
     this.speed = speed;
   }
   update(dt: number) {
@@ -30,30 +31,6 @@ export class Sprite {
     if (m.loop) this.t %= dur;
     else if (this.t >= dur) { this.t = dur - 1e-4; this.done = true; }
   }
-  frameIndex(): number {
-    const m = this.meta();
-    return m ? Math.min(m.n - 1, Math.floor(this.t * m.fps)) : 0;
-  }
-  frame(dir: number): FrameMeta | undefined {
-    const m = this.meta();
-    if (!m) return undefined;
-    let tb = this.cache.get(this.anim);
-    if (!tb) {
-      tb = [];
-      const fr = this.atlas.meta.frames;
-      for (let d = 0; d < 8; d++) {
-        const row: FrameMeta[] = [];
-        for (let f = 0; f < m.n; f++) {
-          const k = fr[`${this.prefix}${this.anim}_${d}_${f}`] ?? fr[`${this.prefix}${this.anim}_0_${f}`];
-          if (k) row.push(k);
-        }
-        tb.push(row);
-      }
-      this.cache.set(this.anim, tb);
-    }
-    const row = tb[dir];
-    return row[Math.min(row.length - 1, this.frameIndex())];
-  }
 }
 export type EKind = 'player' | 'mob' | 'npc';
 let nextId = 1;
@@ -62,6 +39,8 @@ export class Entity {
   id = nextId++;
   y = 0;
   dir = 0;
+  /** 精确朝向角（绕 Y，0 = 面向 +z）；dir 是它量化到 8 方向的结果，只给逻辑用 */
+  yaw = 0;
   scale = 1;
   tint?: [number, number, number];
   radius = 0.4;
@@ -87,9 +66,11 @@ export class Entity {
   faceTo(tx: number, tz: number) {
     const dx = tx - this.x, dz = tz - this.z;
     if (dx * dx + dz * dz < 1e-6) return;
-    this.dir = ((Math.round(Math.atan2(dx, dz) / (Math.PI / 4)) % 8) + 8) % 8;
+    this.yaw = Math.atan2(dx, dz);
+    this.dir = ((Math.round(this.yaw / (Math.PI / 4)) % 8) + 8) % 8;
   }
-  get faceAngle() { return this.dir * (Math.PI / 4); }
+  setDir(d: number) { this.dir = d; this.yaw = d * (Math.PI / 4); }
+  get faceAngle() { return this.yaw; }
 
   /** 沿路径移动，返回是否仍在移动 */
   step(world: World, speed: number, dt: number): boolean {
@@ -131,13 +112,13 @@ export class Mob extends Entity {
     super('mob', spr, x, z);
     this.name = def.name; this.hp = this.hpMax = def.hp; this.scale = def.scale; this.tint = def.tint;
     this.radius = def.radius * def.scale; this.height = def.height * def.scale;
-    this.dir = Math.floor(Math.random() * 8);
+    this.setDir(Math.floor(Math.random() * 8));
   }
 }
 
 export class Npc extends Entity {
   constructor(public def: NpcDef, spr: Sprite, x: number, z: number, dir: number) {
     super('npc', spr, x, z);
-    this.name = def.name; this.dir = dir; this.radius = 0.45;
+    this.name = def.name; this.setDir(dir); this.radius = 0.45;
   }
 }

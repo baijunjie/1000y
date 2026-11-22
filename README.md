@@ -1,7 +1,7 @@
 # 栖云录
 
-原创武侠题材的 2D 俯视角单机 demo，直接在浏览器里玩。
-画面是「3D 预渲染的 2D 贴图 + 实时 2D 光照」：所有角色、建筑、草木都由 three.js 离线渲染成贴图，游戏运行时不做任何 3D 渲染。
+原创武侠题材的俯视角单机 demo，直接在浏览器里玩。
+画面是实时 3D：人物、动物、建筑、草木都由代码程序化建模，运行时用 three.js 渲染——日月与灯火的动态阴影、体积雾与光束、PBR 材质、环境光遮蔽与泛光。整体基调偏暗，黄昏与夜晚靠灯笼、火把、篝火照明。
 
 ## 运行
 
@@ -11,7 +11,7 @@ pnpm dev        # 打开终端里给出的地址
 pnpm build      # 产物在 dist/，可用 pnpm preview 查看
 ```
 
-需要支持 WebGL2 的桌面浏览器（Chrome / Edge / Safari 新版）。
+需要支持 WebGL2 的桌面浏览器（Chrome / Edge / Safari 新版）和一块像样的显卡；目前只在 Apple M4 上跑过。
 
 ## 玩法
 
@@ -33,9 +33,11 @@ pnpm build      # 产物在 dist/，可用 pnpm preview 查看
 - **写实比例，不要 Q 版**：人物约八头身，躯体是蒙皮的连续曲面，不能有木偶式的分节感；动物同理。
 - **朴素的武侠，不是仙侠**：粗布、皮革、铁器、斗笠、绑腿这类江湖气的行头；不要白衣飘飘、玉冠、渐变纱袍一类的仙气装扮。
 - **有力量感**：主角是宽肩厚胸、赤臂见肌肉的练家子，不是清秀美男。
-- 主角戴斗笠（45° 俯视下头顶是最显眼的部分，斗笠即是角色的标志）。
+- 主角戴斗笠（俯视下头顶是最显眼的部分，斗笠即是角色的标志）。
+- **光影是暗色调的**：环境光压得很低，白天是阴沉、低饱和、明暗对比强的天光，夜里主要靠局部灯火；灯火会给人物投出跟着走的影子。
+- **只有冷兵器的刀光剑影**：出招的特效是刃尖划出的一道细弧、金铁交击的几点火星、脚下的扬尘。没有光环、光球、发光的剑气之类的法术特效。
 
-人物与动物的建模代码在 `tools/bake/src/humanoid.ts`、`tools/bake/src/creature_*.ts`，造型参数在 `tools/bake/src/jobs.ts`。
+人物与动物的建模代码在 `src/models/humanoid.ts`、`src/models/creature_*.ts`，造型参数在 `src/models/looks.ts`。
 
 接手开发前先读 [开发笔记](docs/dev-notes.md)：设计取舍的原因、踩过的坑、验证方法和还欠着的事都在里面。
 
@@ -43,37 +45,33 @@ pnpm build      # 产物在 dist/，可用 pnpm preview 查看
 
 | 路径 | 内容 |
 |---|---|
-| `src/engine/` | WebGL2 渲染器（G-Buffer、延迟光照、阴影遮罩、水面、泛光）、资源加载、程序合成音频 |
+| `src/engine/renderer.ts` | 场景、镜头、日月主光、点光源池（含阴影槽位分配）、特效批次 |
+| `src/engine/post.ts` | 后期处理：环境光遮蔽、体积雾（贴地雾气、日光光束、灯火光晕）、泛光、色调映射与调色 |
+| `src/engine/statics.ts` | 静态物件：建模结果压平、按地块实例化、树冠瘦身、阴影代理、遮挡挖空与随风摆动 |
+| `src/engine/ground.ts` | 地表（五层 PBR 贴图按 splat 图混合、河床下陷）与水面 |
+| `src/engine/actors.ts` | 角色：实时姿势求值与过渡、布料解算、网格合并、刀光拖尾 |
+| `src/engine/audio.ts` | 程序合成的音效与配乐 |
+| `src/models/` | 程序化建模：人形、四足动物、建筑、道具、树木花草，以及材质与贴图 |
 | `src/game/` | 世界与寻路、实体、战斗与修炼、任务、昼夜环境、粒子 |
 | `src/ui/` | DOM 界面与世界标注 |
-| `src/shared/consts.ts` | 烘焙与运行时共用的投影常量和图集格式 |
-| `tools/bake/` | 离线烘焙：程序化 3D 建模 → 颜色 / 法线 / 高度 / 光泽 / 阴影图集 |
 | `tools/map/build-map.mjs` | 生成世界地图（地表混合图、物件摆放、刷怪点、NPC） |
 | `tools/map/check-map.mjs` | 校验地图：出生点到各 NPC、刷怪点、采集点是否走得通 |
+| `tools/tex/fetch.mjs` | 下载 CC0 写实贴图并转成游戏用的格式 |
 | `tools/shot.mjs` | 在无头 Chrome 里打开游戏并截图，用于验证画面 |
-| `public/assets/` | 烘焙产物与地图数据 |
+| `public/assets/` | 贴图与地图数据 |
 
-## 重新生成素材
+## 素材
 
-烘焙需要本机装有 Chrome（路径可用环境变量 `CHROME_PATH` 指定）。
+模型全部由仓库里的代码生成，没有模型文件。贴图有两类：
+
+- 程序贴图（人物衣料、招牌、窗格等）：建模时在画布上画出来。
+- CC0 写实贴图（地表、木、石、砖、灰泥、茅草、树皮等）：来自 Poly Haven，颜色 / 法线 / 粗糙度各一张，放在 `public/assets/tex/`，来源与作者见该目录下的 `CREDITS.md`。
 
 ```bash
-pnpm bake <任务名>...                       # 例如 pnpm bake player_sword npcs env_trees
-pnpm bake <任务名> --preview --filter='正则'  # 只出预览图到 tmp/preview，不写图集
+pnpm tex                                    # 重新下载并转换 CC0 贴图（原图缓存在 tmp/tex-cache）
 pnpm map                                    # 重新生成地图
-node tools/map/check-map.mjs                # 校验地图连通性
-pnpm shot --out=tmp/shot.png --x=100 --z=108 --hour=18
+pnpm check-map                              # 校验地图连通性
+pnpm shot --out=tmp/shot.png --x=100 --z=108 --hour=22 --zoom=1.5
 ```
 
-任务名见 `tools/bake/src/jobs.ts`、`tools/bake/src/creatures.ts`、`tools/bake/src/env/`。
-
-## 图集格式
-
-每个图集三张图加一份 json：
-
-- `*.color.webp`：颜色，线性空间预乘 alpha 后做 sRGB 编码；已烘入天空遮蔽。
-- `*.normal.webp`：R、G 为视空间法线的 x、y，B 为离地高度（× `hScale` 米），A 为「1 − 光泽」。
-- `*.shadow.webp`：R 为日光投影，G 为地面环境遮蔽。
-- `*.json`：帧矩形与锚点、动画表、碰撞与灯光等附加信息。
-
-运行时由高度通道还原每个像素的世界坐标，做逐像素深度遮挡和点光源光照。
+截图与地图校验需要本机装有 Chrome（路径可用环境变量 `CHROME_PATH` 指定）。
